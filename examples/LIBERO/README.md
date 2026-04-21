@@ -52,7 +52,7 @@ Afterwards, inside the `LIBERO` environment, install the following dependencies:
 
 ```bash
 pip install tyro matplotlib mediapy websockets msgpack
-pip install numpy==1.24.4
+pip install numpy==1.24.4 mujoco==3.2.3
 ```
 
 ---

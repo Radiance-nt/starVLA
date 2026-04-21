@@ -80,7 +80,7 @@ If a change affects how users interact with the project (e.g., a new CLI flag, a
 ### Step 3 — Style guidelines
 
 - Match the tone and heading structure of the file you are editing.
-- Use fenced code blocks with a language tag (` ```bash `, ` ```yaml `, ` ```python `).
+- Use fenced code blocks with a language tag — `bash`, `yaml`, or `python` — so syntax highlighting works.
 - Prefer relative links between docs files (e.g., `[FAQ](faq.md)`) over absolute URLs.
 - Keep line length reasonable; no hard limit, but avoid very long unwrapped paragraphs.
 - Use `<details>` / `<summary>` for optional or advanced content, consistent with existing usage.

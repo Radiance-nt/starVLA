@@ -285,6 +285,8 @@ DATASET_NAMED_MIXTURES = {
         ("stamp_seal", 1.0, "robotwin"),
         ("turn_switch", 1.0, "robotwin"),
     ],
+    "robotwin_unified": [("robotwin_unified", 1.0, "robotwin")],
+    "robotwin_unified_50": [("robotwin_unified", 1.0, "robotwin50")],
     "robotwin_task1": [("adjust_bottle", 1.0, "robotwin")],
     "robotwin_task2": [("place_a2b_left", 1.0, "robotwin"), ("place_a2b_right", 1.0, "robotwin")],
     "arx_x5": [("arx_x5", 1.0, "arx_x5")],

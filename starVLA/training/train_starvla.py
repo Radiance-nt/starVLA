@@ -117,14 +117,18 @@ class VLATrainer(TrainerUtils):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
         set_seed(seed)
+        logger.info(f"Rank {rank}: seed set to {seed}")
 
         # Save config snapshots upfront so that even if a later setup step
         # (ckpt load / DeepSpeed init / dataloader build) crashes, the
         # produced run dir is still introspectable / from_pretrained-able.
         self._save_initial_configs()
+        logger.info(f"Rank {rank}: initial configs saved")
 
         self._init_checkpointing()
+        logger.info(f"Rank {rank}: checkpoint initialization finished")
         self._adjust_lr_scheduler_for_resume()
+        logger.info(f"Rank {rank}: scheduler adjustment finished")
 
         freeze_modules = (
             self.config.trainer.freeze_modules
@@ -132,16 +136,21 @@ class VLATrainer(TrainerUtils):
             else None
         )
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
+        logger.info(f"Rank {rank}: backbone freeze step finished")
         self.print_trainable_parameters(self.model)
+        logger.info(f"Rank {rank}: trainable parameter summary printed")
 
+        logger.info(f"Rank {rank}: entering accelerator.prepare")
         self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
             self.accelerator,
             self.model,
             self.optimizer,
             self.vla_train_dataloader,
         )
+        logger.info(f"Rank {rank}: accelerator.prepare finished")
 
         self._init_wandb()
+        logger.info(f"Rank {rank}: wandb initialization finished")
 
     def _calculate_total_batch_size(self):
         """Calculate global batch size."""
@@ -154,13 +163,16 @@ class VLATrainer(TrainerUtils):
     def _init_wandb(self):
         """Initialize Weights & Biases."""
         if self.accelerator.is_main_process:
+            logger.info("Main process: starting wandb.init")
             wandb.init(
                 name=self.config.run_id,
                 dir=os.path.join(self.config.output_dir, "wandb"),
                 project=self.config.wandb_project,
                 entity=self.config.wandb_entity,
                 group="vla-train",
+                settings=wandb.Settings(init_timeout=300),
             )
+            logger.info("Main process: wandb.init completed")
 
     def _save_initial_configs(self):
         """Save full config and training script at the very start of training."""
@@ -365,7 +377,7 @@ class VLATrainer(TrainerUtils):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                total_loss = output_dict.get("total_loss", action_loss)
 
             self.accelerator.backward(total_loss)
 
@@ -375,9 +387,13 @@ class VLATrainer(TrainerUtils):
             self.optimizer.step()
             self.lr_scheduler.step()
 
-        return {
-            "action_dit_loss": action_loss.item(),
-        }
+        metrics = {}
+        for key, value in output_dict.items():
+            if isinstance(value, torch.Tensor) and value.ndim == 0:
+                metrics[key] = value.item()
+
+        metrics.setdefault("action_dit_loss", action_loss.item())
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""
@@ -409,9 +425,13 @@ def main(cfg) -> None:
     logger.info("✅ Configuration wrapped for access tracking")
 
     output_dir = setup_directories(cfg=cfg)
+    logger.info("Output directory prepared")
     vla = build_framework(cfg)
+    logger.info("Framework built")
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    logger.info("Dataloader prepared")
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
+    logger.info("Optimizer and scheduler prepared")
 
     trainer = VLATrainer(
         cfg=cfg,

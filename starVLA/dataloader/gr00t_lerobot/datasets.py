@@ -609,7 +609,6 @@ class LeRobotSingleDataset(Dataset):
             self.tag = embodiment_tag.value
         else:
             self.tag = embodiment_tag
-
         self._init_action_mode()
         self._metadata = self._get_metadata(EmbodimentTag(self.tag))
 
@@ -944,7 +943,6 @@ class LeRobotSingleDataset(Dataset):
                                 "chunk_index": int(episode[chunk_col]),
                                 "file_index": int(episode[file_col]),
                             }
-                    print(video_file_indices)
                     episode_meta = {
                         "data/chunk_index": episode["data/chunk_index"],
                         "data/file_index": episode["data/file_index"],
@@ -1366,15 +1364,51 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        return self._pack_sample(data, trajectory_id=trajectory_id, base_index=base_index)
 
-    def _pack_sample(self, data: dict) -> dict:
-        """Pack transformed modality data into training sample format."""
+    def _set_current_trajectory_cache(self, trajectory_id: int, trajectory_data: pd.DataFrame) -> pd.DataFrame:
+        """Cache the active trajectory so repeated step reads in one sample reuse the same parquet slice."""
+        self.curr_traj_id = trajectory_id
+        self.curr_traj_data = trajectory_data
+        return trajectory_data
+
+    def _build_step_images(self, data: dict) -> list[Image.Image]:
+        """Convert transformed multi-view arrays into resized PIL images."""
         step_images = []
         for video_key in self.modality_keys["video"]:
             image = data[video_key][0]
             image = Image.fromarray(image).resize((224, 224))
             step_images.append(image)
+        return step_images
+
+    def _build_future_images(self, trajectory_id: int, base_index: int) -> dict[int, list[Image.Image]]:
+        """Optionally sample future observations from the same trajectory for auxiliary losses."""
+        if self.data_cfg is None:
+            return {}
+
+        if self.data_cfg.get("return_future_obs", False) in [False, "False", None]:
+            return {}
+
+        horizons = self.data_cfg.get("future_obs_horizons", [])
+        if not horizons:
+            return {}
+
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        max_length = int(self.trajectory_lengths[trajectory_index])
+        future_images = {}
+
+        for horizon in horizons:
+            horizon = int(horizon)
+            future_base_index = min(base_index + horizon, max_length - 1)
+            future_raw_data = self.get_step_video_data(trajectory_id, future_base_index)
+            future_data = self.transforms(future_raw_data)
+            future_images[horizon] = self._build_step_images(future_data)
+
+        return future_images
+
+    def _pack_sample(self, data: dict, trajectory_id: int | None = None, base_index: int | None = None) -> dict:
+        """Pack transformed modality data into training sample format."""
+        step_images = self._build_step_images(data)
 
         language = data[self.modality_keys["language"][0]][0]
         action = []
@@ -1395,6 +1429,11 @@ class LeRobotSingleDataset(Dataset):
                 state.append(data[state_key])
             state = np.concatenate(state, axis=1).astype(np.float16)
             sample["state"] = state
+
+        if trajectory_id is not None and base_index is not None:
+            future_images = self._build_future_images(trajectory_id, base_index)
+            if future_images:
+                sample["future_images"] = future_images
 
         return sample
 
@@ -1425,14 +1464,23 @@ class LeRobotSingleDataset(Dataset):
             }
         """
         data = {}
-        # Get the data for all modalities # just for action base data
-        self.curr_traj_data = self.get_trajectory_data(trajectory_id)
+        # Keep the current trajectory cached so future frame lookups within the same
+        # sample do not re-read the parquet file.
+        self._set_current_trajectory_cache(trajectory_id, self.get_trajectory_data(trajectory_id))
         # TODO @JinhuiYE The logic below is poorly implemented. Data reading should be directly based on curr_traj_data.
         for modality in self.modality_keys:
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
         data = self._apply_action_mode(data)
+        return data
+
+    def get_step_video_data(self, trajectory_id: int, base_index: int) -> dict:
+        """Load only video modalities for auxiliary future-frame supervision."""
+        data = {}
+        self._set_current_trajectory_cache(trajectory_id, self.get_trajectory_data(trajectory_id))
+        for key in self.modality_keys["video"]:
+            data[key] = self.get_data_by_modality(trajectory_id, "video", key, base_index)
         return data
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
@@ -1447,7 +1495,7 @@ class LeRobotSingleDataset(Dataset):
                     episode_chunk=chunk_index, episode_index=trajectory_id
                 )
                 assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-                return pd.read_parquet(parquet_path)
+                return self._set_current_trajectory_cache(trajectory_id, pd.read_parquet(parquet_path))
         elif self._lerobot_version == "v3.0":
             return self.get_trajectory_data_lerobot_v3(trajectory_id)
     
@@ -1470,7 +1518,7 @@ class LeRobotSingleDataset(Dataset):
             
             # filter by trajectory_id
             episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
-            return episode_data
+            return self._set_current_trajectory_cache(trajectory_id, episode_data)
 
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
@@ -2371,9 +2419,9 @@ class LeRobotMixtureDataset(Dataset):
                         break
                     index = random.randint(0, len(self) - 1)
                     
-                raw_data = dataset.get_step_data(trajectory_id, step)    
+                raw_data = dataset.get_step_data(trajectory_id, step)
                 data = dataset.transforms(raw_data)
-                sample = dataset._pack_sample(data)
+                sample = dataset._pack_sample(data, trajectory_id=trajectory_id, base_index=step)
                 
                 return sample
                 

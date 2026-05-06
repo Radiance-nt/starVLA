@@ -1381,30 +1381,38 @@ class LeRobotSingleDataset(Dataset):
             step_images.append(image)
         return step_images
 
-    def _build_future_images(self, trajectory_id: int, base_index: int) -> dict[int, list[Image.Image]]:
-        """Optionally sample future observations from the same trajectory for auxiliary losses."""
+    def _sample_discounted_future_delta(self, max_future_steps: int) -> int:
+        """Sample a single future offset from a discounted distribution."""
+        if max_future_steps <= 0:
+            return 0
+
+        gamma = 0.99
+        if self.data_cfg is not None:
+            gamma = float(self.data_cfg.get("dfc_gamma", gamma))
+        gamma = min(max(gamma, 0.0), 0.999999)
+
+        deltas = np.arange(1, max_future_steps + 1, dtype=np.int64)
+        weights = np.power(gamma, deltas - 1, dtype=np.float64)
+        weights = weights / weights.sum()
+        return int(np.random.choice(deltas, p=weights))
+
+    def _build_future_observation(self, trajectory_id: int, base_index: int) -> tuple[list[Image.Image], int] | tuple[None, None]:
+        """Optionally sample one discounted future observation from the same trajectory."""
         if self.data_cfg is None:
-            return {}
+            return None, None
 
         if self.data_cfg.get("return_future_obs", False) in [False, "False", None]:
-            return {}
-
-        horizons = self.data_cfg.get("future_obs_horizons", [])
-        if not horizons:
-            return {}
+            return None, None
 
         trajectory_index = self.get_trajectory_index(trajectory_id)
         max_length = int(self.trajectory_lengths[trajectory_index])
-        future_images = {}
-
-        for horizon in horizons:
-            horizon = int(horizon)
-            future_base_index = min(base_index + horizon, max_length - 1)
-            future_raw_data = self.get_step_video_data(trajectory_id, future_base_index)
-            future_data = self.transforms(future_raw_data)
-            future_images[horizon] = self._build_step_images(future_data)
-
-        return future_images
+        max_future_steps = max(0, max_length - 1 - base_index)
+        sampled_delta = self._sample_discounted_future_delta(max_future_steps)
+        future_base_index = min(base_index + max(sampled_delta, 1), max_length - 1)
+        effective_delta = future_base_index - base_index
+        future_raw_data = self.get_step_video_data(trajectory_id, future_base_index)
+        future_data = self.transforms(future_raw_data)
+        return self._build_step_images(future_data), effective_delta
 
     def _pack_sample(self, data: dict, trajectory_id: int | None = None, base_index: int | None = None) -> dict:
         """Pack transformed modality data into training sample format."""
@@ -1431,9 +1439,10 @@ class LeRobotSingleDataset(Dataset):
             sample["state"] = state
 
         if trajectory_id is not None and base_index is not None:
-            future_images = self._build_future_images(trajectory_id, base_index)
-            if future_images:
-                sample["future_images"] = future_images
+            future_image, future_delta = self._build_future_observation(trajectory_id, base_index)
+            if future_image is not None:
+                sample["future_image"] = future_image
+                sample["future_delta"] = future_delta
 
         return sample
 

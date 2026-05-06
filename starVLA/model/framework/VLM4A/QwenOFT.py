@@ -20,11 +20,13 @@ Note: How to add special tokens to Qwen2.5:
 
 """
 
+import inspect
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
@@ -44,6 +46,55 @@ from starVLA.model.framework.share_tools import add_discretized_state_to_instruc
 from starVLA.model.modules.action_model.MLP_ActionHeader import get_action_model
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.training.trainer_utils.trainer_tools import resize_images
+
+
+def _select_attention_heads(hidden_size: int) -> int:
+    for num_heads in (8, 4, 2, 1):
+        if hidden_size % num_heads == 0:
+            return num_heads
+    return 1
+
+
+class PMAPooling(nn.Module):
+    """Single-query PMA-style pooling over a token set."""
+
+    def __init__(self, hidden_size: int, num_heads: int, ff_hidden_size: Optional[int] = None) -> None:
+        super().__init__()
+        ff_hidden_size = ff_hidden_size or hidden_size * 2
+        self.token_ff = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, ff_hidden_size),
+            nn.GELU(),
+            nn.Linear(ff_hidden_size, hidden_size),
+        )
+        self.query_norm = nn.LayerNorm(hidden_size)
+        self.key_norm = nn.LayerNorm(hidden_size)
+        self.attn = nn.MultiheadAttention(hidden_size, num_heads=num_heads, batch_first=True)
+        self.out_ff = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        query: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        refined_tokens = self.token_ff(tokens)
+        key_padding_mask = None
+        if token_mask is not None:
+            key_padding_mask = ~token_mask.bool()
+        attn_out, _ = self.attn(
+            query=self.query_norm(query),
+            key=self.key_norm(refined_tokens),
+            value=refined_tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        return self.out_ff(attn_out + query)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -89,28 +140,14 @@ class QwenOFTDefaultConfig:
         }
     )
 
-    future_tokens: dict = field(
-        default_factory=lambda: {
-            "enabled": False,
-            "horizons": [],
-            "order": "reverse",
-            "use_future_tokens_for_action": True,
-            "add_horizon_embedding": True,
-        }
-    )
-
-    contrastive: dict = field(
-        default_factory=lambda: {
-            "enabled": False,
-            "loss_type": "infonce",
-            "projector_hidden_dim": 2048,
-            "projector_out_dim": 128,
-            "temperature": 0.1,
-            "loss_weight": 0.1,
-            "future_encoder": "stopgrad_same_vlm",
-            "negatives": "batch_only",
-        }
-    )
+    use_future_tokens: bool = False
+    num_future_tokens: int = 4
+    contrastive_dim: int = 256
+    dfc_temperature: float = 0.1
+    dfc_gamma: float = 0.99
+    lambda_dfc: float = 0.05
+    target_encoder_type: str = "stopgrad"
+    use_same_language_negatives: bool = False
 
 
 @FRAMEWORK_REGISTRY.register("QwenOFT")
@@ -161,35 +198,54 @@ class Qwenvl_OFT(baseframework):
         # L1 loss
         self.l1_loss = nn.L1Loss()
 
-        future_cfg = self.config.framework.get("future_tokens", {})
-        contrastive_cfg = self.config.framework.get("contrastive", {})
-        self.future_tokens_enabled = bool(future_cfg.get("enabled", False))
-        self.contrastive_enabled = bool(contrastive_cfg.get("enabled", False))
-        self.future_loss_type = str(contrastive_cfg.get("loss_type", "infonce")).lower()
-        self.future_loss_weight = float(contrastive_cfg.get("loss_weight", 0.1))
-        self.future_temperature = float(contrastive_cfg.get("temperature", 0.1))
-        self.use_future_tokens_for_action = bool(future_cfg.get("use_future_tokens_for_action", True))
-        self.add_horizon_embedding = bool(future_cfg.get("add_horizon_embedding", True))
-        self.future_token_order = str(future_cfg.get("order", "reverse")).lower()
-        self.future_horizons = self._prepare_future_horizons(future_cfg.get("horizons", []))
+        legacy_future_cfg = self.config.framework.get("future_tokens", {})
+        legacy_contrastive_cfg = self.config.framework.get("contrastive", {})
 
-        if self.contrastive_enabled and not self.future_tokens_enabled:
-            raise ValueError("framework.contrastive.enabled=true requires framework.future_tokens.enabled=true")
+        self.future_tokens_enabled = bool(
+            self.config.framework.get("use_future_tokens", legacy_future_cfg.get("enabled", False))
+        )
+        self.num_future_tokens = int(self.config.framework.get("num_future_tokens", len(legacy_future_cfg.get("horizons", [])) or 4))
+        self.contrastive_dim = int(
+            self.config.framework.get(
+                "contrastive_dim",
+                legacy_contrastive_cfg.get("projector_out_dim", 256),
+            )
+        )
+        self.dfc_temperature = float(
+            self.config.framework.get("dfc_temperature", legacy_contrastive_cfg.get("temperature", 0.1))
+        )
+        self.dfc_gamma = float(self.config.framework.get("dfc_gamma", 0.99))
+        self.lambda_dfc = float(
+            self.config.framework.get("lambda_dfc", legacy_contrastive_cfg.get("loss_weight", 0.05))
+        )
+        self.target_encoder_type = str(self.config.framework.get("target_encoder_type", "stopgrad")).lower()
+        self.use_same_language_negatives = bool(self.config.framework.get("use_same_language_negatives", False))
+
+        if self.target_encoder_type != "stopgrad":
+            raise NotImplementedError(
+                f"Unsupported target_encoder_type={self.target_encoder_type!r}; only 'stopgrad' is implemented."
+            )
 
         self.future_token_chars: list[str] = []
         self.future_token_ids: list[int] = []
-        self.future_horizon_embedding = None
+        self.future_token_parameters = None
         self.future_condition_fuser = None
-        self.future_projector = None
+        self.anchor_pma = None
+        self.anchor_seed = None
+        self.anchor_projector = None
+        self.target_pma = None
+        self.target_query_seed = None
+        self.target_language_proj = None
+        self.target_projector = None
 
         if self.future_tokens_enabled:
-            if len(self.future_horizons) > len(SAFE_FUTURE_TOKEN_CHARS):
+            if self.num_future_tokens > len(SAFE_FUTURE_TOKEN_CHARS):
                 raise ValueError(
-                    f"Configured {len(self.future_horizons)} future horizons, but only "
+                    f"Configured {self.num_future_tokens} future tokens, but only "
                     f"{len(SAFE_FUTURE_TOKEN_CHARS)} verified single-token markers are available."
                 )
 
-            self.future_token_chars = SAFE_FUTURE_TOKEN_CHARS[: len(self.future_horizons)]
+            self.future_token_chars = SAFE_FUTURE_TOKEN_CHARS[: self.num_future_tokens]
             for token_char in self.future_token_chars:
                 token_ids = self.qwen_vl_interface.processor.tokenizer(
                     token_char, add_special_tokens=False
@@ -198,26 +254,33 @@ class Qwenvl_OFT(baseframework):
                     raise ValueError(f"Future marker {token_char!r} must tokenize to exactly one token, got {token_ids}")
                 self.future_token_ids.append(token_ids[0])
 
-            if self.add_horizon_embedding:
-                self.future_horizon_embedding = nn.Embedding(len(self.future_horizons), self.hidden_size)
-
-            if self.use_future_tokens_for_action:
-                self.future_condition_fuser = nn.Sequential(
-                    nn.LayerNorm(self.hidden_size * 2),
-                    nn.Linear(self.hidden_size * 2, self.hidden_size),
-                    nn.GELU(),
-                    nn.Linear(self.hidden_size, self.hidden_size),
-                )
-
-            if self.contrastive_enabled:
-                projector_hidden_dim = int(contrastive_cfg.get("projector_hidden_dim", self.hidden_size))
-                projector_out_dim = int(contrastive_cfg.get("projector_out_dim", 128))
-                self.future_projector = nn.Sequential(
-                    nn.LayerNorm(self.hidden_size),
-                    nn.Linear(self.hidden_size, projector_hidden_dim),
-                    nn.GELU(),
-                    nn.Linear(projector_hidden_dim, projector_out_dim),
-                )
+            pma_heads = _select_attention_heads(self.hidden_size)
+            self.future_token_parameters = nn.Parameter(
+                torch.randn(self.num_future_tokens, self.hidden_size) * 0.02
+            )
+            self.future_condition_fuser = nn.Sequential(
+                nn.LayerNorm(self.hidden_size * 2),
+                nn.Linear(self.hidden_size * 2, self.hidden_size),
+                nn.GELU(),
+                nn.Linear(self.hidden_size, self.hidden_size),
+            )
+            self.anchor_pma = PMAPooling(self.hidden_size, num_heads=pma_heads)
+            self.anchor_seed = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
+            self.anchor_projector = nn.Sequential(
+                nn.LayerNorm(self.hidden_size),
+                nn.Linear(self.hidden_size, self.hidden_size),
+                nn.GELU(),
+                nn.Linear(self.hidden_size, self.contrastive_dim),
+            )
+            self.target_pma = PMAPooling(self.hidden_size, num_heads=pma_heads)
+            self.target_query_seed = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
+            self.target_language_proj = nn.Linear(self.hidden_size, self.hidden_size)
+            self.target_projector = nn.Sequential(
+                nn.LayerNorm(self.hidden_size),
+                nn.Linear(self.hidden_size, self.hidden_size),
+                nn.GELU(),
+                nn.Linear(self.hidden_size, self.contrastive_dim),
+            )
 
     def forward(
         self,
@@ -255,9 +318,11 @@ class Qwenvl_OFT(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=model_instructions)
+        input_ids = qwen_inputs.get("input_ids", None)
+        model_inputs = self._prepare_model_inputs(qwen_inputs)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
+                **model_inputs,
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
@@ -268,7 +333,6 @@ class Qwenvl_OFT(baseframework):
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             # Extract action token embeddings as action prediction queries
-            input_ids = qwen_inputs.get("input_ids", None)
             action_queries = self._gather_action_token_embeddings(
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
@@ -277,10 +341,8 @@ class Qwenvl_OFT(baseframework):
                 future_hidden = self._gather_specific_token_embeddings(
                     last_hidden, input_ids, self.future_token_ids
                 )
-                future_hidden = self._apply_horizon_embedding(future_hidden)
-                action_queries = self._condition_action_queries(action_queries, future_hidden)
 
-            pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
+            pred_actions = self._predict_action(action_queries, future_hidden=future_hidden)  # (B, chunk_len, action_dim)
 
             # Label alignment: take the last chunk_len segment
             actions = torch.tensor(
@@ -292,16 +354,16 @@ class Qwenvl_OFT(baseframework):
             action_loss = self.l1_loss(pred_actions, actions_target)
 
             total_loss = action_loss
-            output_dict = {"action_loss": action_loss}
+            output_dict = {"action_loss": action_loss, "L_act": action_loss}
 
-            if self.contrastive_enabled:
-                future_loss = self._compute_future_auxiliary_loss(
+            if self.future_tokens_enabled:
+                dfc_metrics = self._compute_dfc_loss(
                     examples=examples,
                     base_instructions=base_instructions,
                     future_hidden=future_hidden,
                 )
-                total_loss = total_loss + self.future_loss_weight * future_loss
-                output_dict["future_loss"] = future_loss
+                total_loss = total_loss + self.lambda_dfc * dfc_metrics["L_dfc"]
+                output_dict.update(dfc_metrics)
 
             output_dict["total_loss"] = total_loss
 
@@ -342,9 +404,11 @@ class Qwenvl_OFT(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=model_instructions)
+        input_ids = qwen_inputs.get("input_ids", None)
+        model_inputs = self._prepare_model_inputs(qwen_inputs)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
+                **model_inputs,
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
@@ -355,17 +419,15 @@ class Qwenvl_OFT(baseframework):
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             # Extract action token embeddings as action prediction queries
-            input_ids = qwen_inputs.get("input_ids", None)
             action_queries = self._gather_action_token_embeddings(
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
+            future_hidden = None
             if self.future_tokens_enabled:
                 future_hidden = self._gather_specific_token_embeddings(
                     last_hidden, input_ids, self.future_token_ids
                 )
-                future_hidden = self._apply_horizon_embedding(future_hidden)
-                action_queries = self._condition_action_queries(action_queries, future_hidden)
-            pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
+            pred_actions = self._predict_action(action_queries, future_hidden=future_hidden)  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
@@ -424,16 +486,6 @@ class Qwenvl_OFT(baseframework):
         action_queries = last_hidden.gather(dim=1, index=expanded_index)  # [B, chunk_len, H]
         return action_queries
 
-    def _prepare_future_horizons(self, horizons: List[int]) -> list[int]:
-        horizons = [int(h) for h in horizons]
-        if not horizons:
-            return []
-        if self.future_token_order == "reverse":
-            return sorted(horizons, reverse=True)
-        if self.future_token_order == "forward":
-            return sorted(horizons)
-        return horizons
-
     def _build_base_instructions(self, instructions: List[str], state: Optional[List[np.ndarray]]) -> List[str]:
         return self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
 
@@ -441,7 +493,7 @@ class Qwenvl_OFT(baseframework):
         future_prompt = ""
         if self.future_tokens_enabled and self.future_token_chars:
             marker_text = "".join(f"[{token_char}]" for token_char in self.future_token_chars)
-            future_prompt = f" Future context tokens (far-to-near): {marker_text}."
+            future_prompt = f" Intention tokens: {marker_text}."
 
         action_tokens = self.action_token * self.chunk_len
         prompt_suffix = (
@@ -475,14 +527,6 @@ class Qwenvl_OFT(baseframework):
         gather_index = stacked_positions.unsqueeze(-1).expand(batch_size, len(token_ids), hidden_dim)
         return last_hidden.gather(dim=1, index=gather_index)
 
-    def _apply_horizon_embedding(self, future_hidden: torch.Tensor) -> torch.Tensor:
-        if self.future_horizon_embedding is None:
-            return future_hidden
-
-        horizon_index = torch.arange(len(self.future_horizons), device=future_hidden.device)
-        horizon_emb = self.future_horizon_embedding(horizon_index).unsqueeze(0)
-        return future_hidden + horizon_emb
-
     def _condition_action_queries(
         self,
         action_queries: torch.Tensor,
@@ -491,9 +535,37 @@ class Qwenvl_OFT(baseframework):
         if future_hidden is None or self.future_condition_fuser is None:
             return action_queries
 
-        future_context = future_hidden.mean(dim=1, keepdim=True).expand(-1, action_queries.shape[1], -1)
+        future_context = self._pool_future_tokens(future_hidden).unsqueeze(1).expand(-1, action_queries.shape[1], -1)
         fused_input = torch.cat([action_queries, future_context], dim=-1)
         return self.future_condition_fuser(fused_input)
+
+    def _prepare_model_inputs(self, qwen_inputs: dict) -> dict:
+        if not self.future_tokens_enabled or self.future_token_parameters is None:
+            return qwen_inputs
+
+        input_ids = qwen_inputs.get("input_ids", None)
+        if input_ids is None:
+            raise ValueError("Future token conditioning requires `input_ids` in Qwen inputs.")
+
+        inputs_embeds = self.qwen_vl_interface.model.get_input_embeddings()(input_ids)
+        for token_index, token_id in enumerate(self.future_token_ids):
+            token_mask = input_ids == token_id
+            if not token_mask.any():
+                raise RuntimeError(f"Future marker token {token_id} missing from the input sequence.")
+            replacement = self.future_token_parameters[token_index].to(
+                device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
+            )
+            inputs_embeds = torch.where(
+                token_mask.unsqueeze(-1),
+                replacement.view(1, 1, -1),
+                inputs_embeds,
+            )
+
+        model_inputs = dict(qwen_inputs)
+        model_inputs.pop("input_ids", None)
+        model_inputs["inputs_embeds"] = inputs_embeds
+        return model_inputs
 
     def _pool_hidden_states(
         self,
@@ -507,98 +579,166 @@ class Qwenvl_OFT(baseframework):
         denom = mask.sum(dim=1).clamp_min(1.0)
         return (hidden_states * mask).sum(dim=1) / denom
 
-    def _get_future_images_for_horizon(self, examples: List[dict], horizon: int) -> List[List[Image.Image]]:
-        batch_images = []
-        for example in examples:
-            future_images = example.get("future_images", None)
-            if future_images is None:
-                raise ValueError(
-                    "RC-CAFT future loss requires `future_images` in the batch. "
-                    "Set datasets.vla_data.return_future_obs=true and future_obs_horizons accordingly."
-                )
+    def _pool_future_tokens(self, future_hidden: torch.Tensor) -> torch.Tensor:
+        if self.anchor_pma is None or self.anchor_seed is None:
+            raise ValueError("Future token pooling requested but anchor PMA is not initialized.")
 
-            if horizon in future_images:
-                batch_images.append(future_images[horizon])
-            elif str(horizon) in future_images:
-                batch_images.append(future_images[str(horizon)])
-            else:
-                raise KeyError(f"Missing future horizon {horizon} in sample future_images keys={list(future_images.keys())}")
-        return batch_images
+        seed = self.anchor_seed.expand(future_hidden.shape[0], -1, -1).to(device=future_hidden.device, dtype=future_hidden.dtype)
+        pooled = self.anchor_pma(future_hidden, seed)
+        return pooled[:, 0, :]
 
-    def _encode_future_targets(
+    def _predict_action(
+        self,
+        action_queries: torch.Tensor,
+        future_hidden: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        predict_action = getattr(self.action_model, "predict_action")
+        signature = inspect.signature(predict_action)
+        if future_hidden is not None and "future_condition_tokens" in signature.parameters:
+            return predict_action(action_queries, future_condition_tokens=future_hidden)
+        if future_hidden is not None:
+            action_queries = self._condition_action_queries(action_queries, future_hidden)
+        return predict_action(action_queries)
+
+    def _build_future_batch(
         self,
         examples: List[dict],
-        base_instructions: List[str],
-    ) -> Dict[int, torch.Tensor]:
-        if not self.future_horizons:
-            return {}
+    ) -> tuple[List[List[Image.Image]], torch.Tensor]:
+        future_images = []
+        sampled_deltas = []
+        for example in examples:
+            future_image = example.get("future_image", None)
+            if future_image is None:
+                raise ValueError(
+                    "DFT-VLA requires `future_image` in each batch sample. "
+                    "Set datasets.vla_data.return_future_obs=true."
+                )
+            future_images.append(future_image)
+            sampled_deltas.append(int(example.get("future_delta", 0)))
+        return future_images, torch.tensor(sampled_deltas, device=self.qwen_vl_interface.model.device, dtype=torch.float32)
 
-        batch_size = len(examples)
-        flat_future_images: List[List[Image.Image]] = []
-        flat_instructions: List[str] = []
-
-        for horizon in self.future_horizons:
-            future_images = self._get_future_images_for_horizon(examples, horizon)
-            flat_future_images.extend(future_images)
-            flat_instructions.extend(base_instructions)
-
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-            images=flat_future_images,
-            instructions=flat_instructions,
-        )
-
+    def _encode_text_only_targets(
+        self,
+        instructions: List[str],
+    ) -> torch.Tensor:
+        text_only_images = [[] for _ in instructions]
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=text_only_images, instructions=instructions)
         with torch.no_grad():
-            future_outputs = self.qwen_vl_interface(
+            text_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
             )
-            pooled_future = self._pool_hidden_states(
-                future_outputs.hidden_states[-1], qwen_inputs.get("attention_mask", None)
-            )
+        return self._pool_hidden_states(text_outputs.hidden_states[-1].float(), qwen_inputs.get("attention_mask", None))
 
-        target_embeddings = {}
-        for idx, horizon in enumerate(self.future_horizons):
-            start = idx * batch_size
-            end = start + batch_size
-            target_embeddings[horizon] = pooled_future[start:end]
+    def _encode_future_visual_tokens(
+        self,
+        future_images: List[List[Image.Image]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        empty_instructions = [""] * len(future_images)
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=future_images, instructions=empty_instructions)
+        pixel_values = qwen_inputs.get("pixel_values", None)
+        image_grid_thw = qwen_inputs.get("image_grid_thw", None)
+        if pixel_values is None or image_grid_thw is None:
+            raise ValueError("Future target encoding requires pixel_values and image_grid_thw.")
 
-        return target_embeddings
+        with torch.no_grad():
+            image_features = self.qwen_vl_interface.model.get_image_features(pixel_values, image_grid_thw)
 
-    def _compute_future_auxiliary_loss(
+        if isinstance(image_features, tuple) and len(image_features) == 2 and isinstance(image_features[0], (list, tuple)):
+            image_feature_chunks = image_features[0]
+        else:
+            image_feature_chunks = image_features
+
+        view_counts = [len(sample_images) for sample_images in future_images]
+        grouped_tokens = []
+        max_tokens = 0
+        cursor = 0
+        for view_count in view_counts:
+            sample_chunks = image_feature_chunks[cursor : cursor + view_count]
+            cursor += view_count
+            sample_tokens = torch.cat(sample_chunks, dim=0)
+            grouped_tokens.append(sample_tokens)
+            max_tokens = max(max_tokens, sample_tokens.shape[0])
+
+        batch_size = len(grouped_tokens)
+        hidden_size = grouped_tokens[0].shape[-1]
+        token_tensor = grouped_tokens[0].new_zeros((batch_size, max_tokens, hidden_size))
+        token_mask = torch.zeros((batch_size, max_tokens), device=grouped_tokens[0].device, dtype=torch.bool)
+        for idx, sample_tokens in enumerate(grouped_tokens):
+            token_tensor[idx, : sample_tokens.shape[0]] = sample_tokens
+            token_mask[idx, : sample_tokens.shape[0]] = True
+        return token_tensor, token_mask
+
+    def _encode_future_targets(
+        self,
+        examples: List[dict],
+        base_instructions: List[str],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.target_pma is None or self.target_projector is None or self.target_query_seed is None:
+            raise ValueError("Future target encoder requested but DFT target modules are not initialized.")
+
+        future_images, sampled_deltas = self._build_future_batch(examples)
+        visual_tokens, visual_mask = self._encode_future_visual_tokens(future_images)
+        language_features = self._encode_text_only_targets(base_instructions)
+        target_query = self.target_query_seed.expand(visual_tokens.shape[0], -1, -1)
+        target_query = target_query + self.target_language_proj(language_features).unsqueeze(1)
+        pooled_future = self.target_pma(visual_tokens.float(), target_query, token_mask=visual_mask)[:, 0, :]
+        target_repr = F.normalize(self.target_projector(pooled_future), dim=-1)
+        return target_repr, sampled_deltas
+
+    def _compute_dfc_loss(
         self,
         examples: List[dict],
         base_instructions: List[str],
         future_hidden: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if future_hidden is None or self.future_projector is None:
-            raise ValueError("Future auxiliary loss requested but future token branch is not initialized")
+    ) -> dict:
+        if future_hidden is None or self.anchor_projector is None:
+            raise ValueError("DFT-VLA loss requested but future token branch is not initialized.")
 
-        target_embeddings = self._encode_future_targets(examples, base_instructions)
-        losses = []
+        pooled_future = self._pool_future_tokens(future_hidden.float())
+        anchors = F.normalize(self.anchor_projector(pooled_future), dim=-1)
+        targets, sampled_deltas = self._encode_future_targets(examples, base_instructions)
 
-        for idx, horizon in enumerate(self.future_horizons):
-            anchor = self.future_projector(future_hidden[:, idx, :])
-            target = self.future_projector(target_embeddings[horizon]).detach()
+        gathered_targets = targets
+        gathered_deltas = sampled_deltas
+        rank = 0
+        label_offset = 0
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            local_batch_size = torch.tensor([targets.shape[0]], device=targets.device, dtype=torch.long)
+            batch_size_list = [torch.zeros_like(local_batch_size) for _ in range(world_size)]
+            dist.all_gather(batch_size_list, local_batch_size)
+            label_offset = int(torch.stack(batch_size_list[:rank]).sum().item()) if rank > 0 else 0
+            target_list = [torch.zeros_like(targets) for _ in range(world_size)]
+            delta_list = [torch.zeros_like(sampled_deltas) for _ in range(world_size)]
+            dist.all_gather(target_list, targets.detach())
+            dist.all_gather(delta_list, sampled_deltas.detach())
+            gathered_targets = torch.cat(target_list, dim=0)
+            gathered_deltas = torch.cat(delta_list, dim=0)
 
-            anchor = F.normalize(anchor.float(), dim=-1)
-            target = F.normalize(target.float(), dim=-1)
+        logits = torch.matmul(anchors.float(), gathered_targets.float().T) / self.dfc_temperature
+        labels = torch.arange(anchors.shape[0], device=logits.device) + label_offset
+        dfc_loss = F.cross_entropy(logits, labels)
 
-            if self.future_loss_type == "l2":
-                loss_h = F.mse_loss(anchor, target)
-            elif self.future_loss_type == "cosine":
-                loss_h = 1.0 - F.cosine_similarity(anchor, target, dim=-1).mean()
-            elif self.future_loss_type == "infonce":
-                logits = torch.matmul(anchor, target.T) / self.future_temperature
-                labels = torch.arange(logits.shape[0], device=logits.device)
-                loss_h = F.cross_entropy(logits, labels)
-            else:
-                raise ValueError(f"Unsupported future loss type: {self.future_loss_type}")
+        positive_logits = logits[torch.arange(anchors.shape[0], device=logits.device), labels]
+        negative_mask = torch.ones_like(logits, dtype=torch.bool)
+        negative_mask[torch.arange(anchors.shape[0], device=logits.device), labels] = False
+        negative_logits = logits[negative_mask]
+        contrastive_accuracy = (logits.argmax(dim=-1) == labels).float().mean()
 
-            losses.append(loss_h)
-
-        return torch.stack(losses).mean()
+        output = {
+            "L_dfc": dfc_loss,
+            "dfc_positive_logit": positive_logits.mean(),
+            "dfc_negative_logit": negative_logits.mean() if negative_logits.numel() > 0 else logits.new_zeros(()),
+            "dfc_accuracy": contrastive_accuracy,
+            "sampled_delta_mean": gathered_deltas.mean(),
+            "sampled_delta_min": gathered_deltas.min(),
+            "sampled_delta_max": gathered_deltas.max(),
+        }
+        return output
 
     # Discretised state → instruction prefix (π₀.5 style); shared with QwenPI_v3.
     add_discretized_state_to_instruction = staticmethod(add_discretized_state_to_instruction)

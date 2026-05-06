@@ -6,6 +6,7 @@
 
 "this file is adap from https://github.com/moojink/openvla-oft/blob/main/prismatic/models/action_heads.py"
 
+import torch
 import torch.nn as nn
 
 
@@ -70,22 +71,35 @@ class L1RegressionActionHead(nn.Module):
         super().__init__()
         self.action_dim = action_dim
         self.NUM_ACTIONS_CHUNK = NUM_ACTIONS_CHUNK
+        self.input_dim = input_dim
 
         self.model = MLPResNet(num_blocks=2, input_dim=input_dim, hidden_dim=hidden_dim, output_dim=action_dim)
+        self.future_condition_fuser = nn.Sequential(
+            nn.LayerNorm(input_dim * 2),
+            nn.Linear(input_dim * 2, input_dim),
+            nn.GELU(),
+            nn.Linear(input_dim, input_dim),
+        )
 
-    def predict_action(self, actions_hidden_states):
+    def predict_action(self, actions_hidden_states, future_condition_tokens=None):
         """
         actions_hidden_states: (B, chunk_len, hidden_dim)
         Returns: (B, chunk_len, action_dim)
         """
+        if future_condition_tokens is not None:
+            future_context = future_condition_tokens.mean(dim=1, keepdim=True)
+            future_context = future_context.expand(-1, actions_hidden_states.shape[1], -1)
+            fused_inputs = torch.cat([actions_hidden_states, future_context], dim=-1)
+            actions_hidden_states = self.future_condition_fuser(fused_inputs)
+
         batch_size, chunk_len, hidden_dim = actions_hidden_states.shape
         x = actions_hidden_states.reshape(batch_size * chunk_len, hidden_dim)
         x = self.model(x)  # (B * chunk_len, action_dim)
         actions = x.view(batch_size, chunk_len, self.action_dim)
         return actions
 
-    def forward(self, actions_hidden_states):
-        return self.predict_action(actions_hidden_states)
+    def forward(self, actions_hidden_states, future_condition_tokens=None):
+        return self.predict_action(actions_hidden_states, future_condition_tokens=future_condition_tokens)
 
 
 def get_action_model(config=None):

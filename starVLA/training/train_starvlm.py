@@ -46,6 +46,30 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logger = get_logger(__name__)
 
 
+def _save_state_dict_with_optional_fallback(state_dict, save_path: str, save_format: str) -> str:
+    if save_format == "safetensors":
+        from safetensors.torch import save_file
+
+        save_file(state_dict, save_path)
+        return "safetensors"
+
+    if save_format != "pt":
+        raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+
+    try:
+        torch.save(state_dict, save_path)
+        return "pt"
+    except RuntimeError as exc:
+        logger.warning(f"torch.save failed at {save_path}: {exc}. Falling back to safetensors.")
+        from safetensors.torch import save_file
+
+        fallback_path = save_path.replace("_pytorch_model.pt", "_model.safetensors").replace(
+            "/pytorch_model.pt", "/model.safetensors"
+        )
+        save_file(state_dict, fallback_path)
+        return "safetensors"
+
+
 def load_fast_tokenizer():
     return AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
 
@@ -200,18 +224,20 @@ class VLAMTrainer(TrainerUtils):
 
             state_dict = self.accelerator.get_state_dict(self.model)
             if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, checkpoint_path + "_model.safetensors")
+                saved_format = _save_state_dict_with_optional_fallback(
+                    state_dict, checkpoint_path + "_model.safetensors", save_format
+                )
             elif save_format == "pt":
-                torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
+                saved_format = _save_state_dict_with_optional_fallback(
+                    state_dict, checkpoint_path + "_pytorch_model.pt", save_format
+                )
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
 
             summary_data = {"steps": self.completed_steps}
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
-            self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
+            self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path} ({saved_format})")
 
             if isinstance(self.config, AccessTrackedConfig):
                 logger.info("📊 Saving accessed configuration...")
@@ -223,7 +249,10 @@ class VLAMTrainer(TrainerUtils):
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
-        if self.completed_steps % self.config.trainer.logging_frequency == 0 and dist.get_rank() == 0:
+        if (
+            self.completed_steps % self.config.trainer.logging_frequency == 0
+            and ((not dist.is_initialized()) or dist.get_rank() == 0)
+        ):
             metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
             if hasattr(self.vlm_train_dataloader, "__len__"):
                 dataloader_length = len(self.vlm_train_dataloader)
@@ -318,14 +347,16 @@ class VLAMTrainer(TrainerUtils):
             os.makedirs(final_checkpoint, exist_ok=True)
             state_dict = self.accelerator.get_state_dict(self.model)
             if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, os.path.join(final_checkpoint, "model.safetensors"))
+                saved_format = _save_state_dict_with_optional_fallback(
+                    state_dict, os.path.join(final_checkpoint, "model.safetensors"), save_format
+                )
             elif save_format == "pt":
-                torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+                saved_format = _save_state_dict_with_optional_fallback(
+                    state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"), save_format
+                )
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
-            logger.info(f"Training complete. Final model saved at {final_checkpoint}")
+            logger.info(f"Training complete. Final model saved at {final_checkpoint} ({saved_format})")
 
         if self.accelerator.is_main_process:
             wandb.finish()

@@ -1,73 +1,75 @@
+#!/bin/bash
 
+set -euo pipefail
 
-export NCCL_SOCKET_IFNAME=bond0
-export NCCL_IB_HCA=mlx5_2,mlx5_3
+PROJECT_DIR="${PROJECT_DIR:-/mnt/hwfile/linzhanhui/projects/starVLA}"
+WATCH_SCRIPT="${WATCH_SCRIPT:-${PROJECT_DIR}/examples/LIBERO/train_files/watch_libero_clean_checked_generic_8g.sh}"
 
-# used for check save when communication
-export NCCL_BLOCKING_WAIT=1
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
-export NCCL_SOCKET_TIMEOUT_MS=360000
-###########################################################################################
-# === Please modify the following paths according to your environment ===
-Framework_name=QwenOFT
-freeze_module_list=''
-base_vlm=playground/Pretrained_models/Qwen3-VL-4B-Instruct
-config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
-libero_data_root=playground/Datasets/LEROBOT_LIBERO_DATA
-data_mix=libero_all
-run_root_dir=./playground/Checkpoints
-run_id=1229_libero4in1_qwen3oft
-# === End of environment variable configuration ===
-###########################################################################################
+# Friendly user-facing knobs. Both upper-case and legacy lower-case spellings are accepted.
+FRAMEWORK_NAME="${FRAMEWORK_NAME:-${Framework_name:-QwenOFT}}"
+BASE_VLM="${BASE_VLM:-${base_vlm:-/mnt/petrelfs/linzhanhui/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17}}"
+CONFIG_YAML="${CONFIG_YAML:-${config_yaml:-examples/LIBERO/train_files/starvla_cotrain_libero.yaml}}"
+LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-${libero_data_root:-${PROJECT_DIR}/playground/Datasets/LEROBOT_LIBERO_DATA}}"
+DATA_MIX="${DATA_MIX:-${data_mix:-libero_goal}}"
+RUN_ROOT_DIR="${RUN_ROOT_DIR:-${run_root_dir:-/mnt/petrelfs/linzhanhui/runs_inspect/starVLA}}"
+RUN_ID="${RUN_ID:-${run_id:-}}"
 
+NNODES="${NNODES:-1}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+CPUS_PER_TASK="${CPUS_PER_TASK:-128}"
+PER_DEVICE_BS="${PER_DEVICE_BS:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-2}"
+MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-}"
+NUM_WARMUP_STEPS="${NUM_WARMUP_STEPS:-}"
+ACTION_GOAL_LANG_PROB="${ACTION_GOAL_LANG_PROB:-}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-}"
+LOGGING_FREQUENCY="${LOGGING_FREQUENCY:-}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-}"
 
-# export WANDB_MODE=disabled
+WANDB_PROJECT="${WANDB_PROJECT:-starVLA_LIBERO}"
+WANDB_ENTITY="${WANDB_ENTITY:-radiance}"
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
+PARTITION="${PARTITION:-eailab_link}"
+ACCOUNT="${ACCOUNT:-research}"
+TIME_LIMIT="${TIME_LIMIT:-5-00:00:00}"
+DISABLE_WANDB_PROXY="${DISABLE_WANDB_PROXY:-0}"
+WANDB_HTTP_PROXY="${WANDB_HTTP_PROXY:-}"
+WANDB_HTTPS_PROXY="${WANDB_HTTPS_PROXY:-}"
 
-output_dir=${run_root_dir}/${run_id}
-mkdir -p ${output_dir}
-# mv this script to the output dir
-cp $0 ${output_dir}/
+if [[ ! -x "${WATCH_SCRIPT}" ]]; then
+  echo "[ERROR] watch script not found or not executable: ${WATCH_SCRIPT}" >&2
+  exit 1
+fi
 
+cd "${PROJECT_DIR}"
 
-accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes 8 \
-  starVLA/training/train_starvla.py \
-  --config_yaml ${config_yaml} \
-  --framework.name ${Framework_name} \
-  --framework.qwenvl.base_vlm ${base_vlm} \
-  --datasets.vla_data.data_root_dir ${libero_data_root}\
-  --datasets.vla_data.data_mix ${data_mix} \
-  --datasets.vla_data.per_device_batch_size 16 \
-  --trainer.vla_data.video_backend torchvision_av \
-  --trainer.freeze_modules ${freeze_module_list} \
-  --trainer.max_train_steps 80000 \
-  --trainer.save_interval 10000 \
-  --trainer.logging_frequency 100 \
-  --trainer.eval_interval 100 \
-  --run_root_dir ${run_root_dir} \
-  --run_id ${run_id} \
-  --wandb_project starVLA_Libero \
-  --wandb_entity jinhuiye \
-  # --is_debug True
-
-
-
-##### Multi-Server Multi-GPU training script #####
-  # accelerate launch \
-  #   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  #   --main_process_ip $MASTER_ADDR \
-  #   --main_process_port $MASTER_PORT \
-  #   --machine_rank $SLURM_PROCID \
-  #   --num_machines $SLURM_NNODES \
-  #   --num_processes=${TOTAL_GPUS} \
-  #   starVLA/training/train_starvla.py \
-  #   --config_yaml ${config_yaml} \
-  #   --framework.name ${Framework_name} \
-  #   --framework.qwenvl.base_vlm ${base_vlm} \
-  #   --run_root_dir ${run_root_dir} \
-  #   --run_id ${run_id} \
-  #   --wandb_project your_project \
-  #   --wandb_entity your_name
-##### Multi-Server Multi-GPU training script #####
+exec env \
+  PROJECT_DIR="${PROJECT_DIR}" \
+  FRAMEWORK_NAME="${FRAMEWORK_NAME}" \
+  BASE_VLM="${BASE_VLM}" \
+  CONFIG_YAML="${CONFIG_YAML}" \
+  LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT}" \
+  DATA_MIX="${DATA_MIX}" \
+  RUN_ROOT_DIR="${RUN_ROOT_DIR}" \
+  RUN_ID="${RUN_ID}" \
+  NNODES="${NNODES}" \
+  GPUS_PER_NODE="${GPUS_PER_NODE}" \
+  CPUS_PER_TASK="${CPUS_PER_TASK}" \
+  PER_DEVICE_BS="${PER_DEVICE_BS}" \
+  GRAD_ACCUM="${GRAD_ACCUM}" \
+  MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS}" \
+  NUM_WARMUP_STEPS="${NUM_WARMUP_STEPS}" \
+  ACTION_GOAL_LANG_PROB="${ACTION_GOAL_LANG_PROB}" \
+  SAVE_INTERVAL="${SAVE_INTERVAL}" \
+  LOGGING_FREQUENCY="${LOGGING_FREQUENCY}" \
+  EVAL_INTERVAL="${EVAL_INTERVAL}" \
+  WANDB_PROJECT="${WANDB_PROJECT}" \
+  WANDB_ENTITY="${WANDB_ENTITY}" \
+  ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION}" \
+  PARTITION="${PARTITION}" \
+  ACCOUNT="${ACCOUNT}" \
+  TIME_LIMIT="${TIME_LIMIT}" \
+  DISABLE_WANDB_PROXY="${DISABLE_WANDB_PROXY}" \
+  WANDB_HTTP_PROXY="${WANDB_HTTP_PROXY}" \
+  WANDB_HTTPS_PROXY="${WANDB_HTTPS_PROXY}" \
+  bash "${WATCH_SCRIPT}"

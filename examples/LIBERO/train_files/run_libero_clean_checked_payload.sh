@@ -84,23 +84,23 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 FRAMEWORK_NAME="${FRAMEWORK_NAME:-QwenOFT}"
 BASE_VLM="${BASE_VLM:-/mnt/petrelfs/linzhanhui/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17}"
-CONFIG_YAML="${CONFIG_YAML:-examples/LIBERO/train_files/starvla_cotrain_libero_mgv.yaml}"
+CONFIG_YAML="${CONFIG_YAML:-examples/LIBERO/train_files/starvla_cotrain_libero.yaml}"
 LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-${PROJECT_DIR}/playground/Datasets/LEROBOT_LIBERO_DATA}"
 DATA_MIX="${DATA_MIX:-libero_goal}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 PER_DEVICE_BS="${PER_DEVICE_BS:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-2}"
-MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-62500}"
-NUM_WARMUP_STEPS="${NUM_WARMUP_STEPS:-6250}"
-ACTION_GOAL_LANG_PROB="${ACTION_GOAL_LANG_PROB:-0.8}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
-LOGGING_FREQUENCY="${LOGGING_FREQUENCY:-20}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-1000}"
+MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-}"
+NUM_WARMUP_STEPS="${NUM_WARMUP_STEPS:-}"
+ACTION_GOAL_LANG_PROB="${ACTION_GOAL_LANG_PROB:-}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-}"
+LOGGING_FREQUENCY="${LOGGING_FREQUENCY:-}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-}"
 TRAINER_IS_RESUME="${TRAINER_IS_RESUME:-false}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
 RELOAD_MODULES="${RELOAD_MODULES:-}"
-WANDB_PROJECT="${WANDB_PROJECT:-starVLA_LIBERO_MGV}"
+WANDB_PROJECT="${WANDB_PROJECT:-starVLA_LIBERO}"
 WANDB_ENTITY="${WANDB_ENTITY:-radiance}"
 RUN_ROOT_DIR="${RUN_ROOT_DIR:-/mnt/petrelfs/linzhanhui/runs_inspect/starVLA}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
@@ -133,6 +133,24 @@ fi
 if [[ -n "${SAVE_TOTAL_LIMIT}" ]]; then
   EXTRA_TRAIN_ARGS_STR+=" --trainer.save_total_limit $(printf '%q' "${SAVE_TOTAL_LIMIT}")"
 fi
+if [[ -n "${MAX_TRAIN_STEPS}" ]]; then
+  EXTRA_TRAIN_ARGS_STR+=" --trainer.max_train_steps $(printf '%q' "${MAX_TRAIN_STEPS}")"
+fi
+if [[ -n "${NUM_WARMUP_STEPS}" ]]; then
+  EXTRA_TRAIN_ARGS_STR+=" --trainer.num_warmup_steps $(printf '%q' "${NUM_WARMUP_STEPS}")"
+fi
+if [[ -n "${ACTION_GOAL_LANG_PROB}" ]]; then
+  EXTRA_TRAIN_ARGS_STR+=" --framework.mgv.action_goal_lang_prob $(printf '%q' "${ACTION_GOAL_LANG_PROB}")"
+fi
+if [[ -n "${SAVE_INTERVAL}" ]]; then
+  EXTRA_TRAIN_ARGS_STR+=" --trainer.save_interval $(printf '%q' "${SAVE_INTERVAL}")"
+fi
+if [[ -n "${LOGGING_FREQUENCY}" ]]; then
+  EXTRA_TRAIN_ARGS_STR+=" --trainer.logging_frequency $(printf '%q' "${LOGGING_FREQUENCY}")"
+fi
+if [[ -n "${EVAL_INTERVAL}" ]]; then
+  EXTRA_TRAIN_ARGS_STR+=" --trainer.eval_interval $(printf '%q' "${EVAL_INTERVAL}")"
+fi
 
 git rev-parse HEAD > "${OUTPUT_DIR}/git_rev.txt"
 git status --short > "${OUTPUT_DIR}/git_status.txt"
@@ -153,8 +171,8 @@ echo "[INFO] TOTAL_BATCH_SIZE=${TOTAL_BATCH_SIZE}"
 echo "[INFO] ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION}"
 echo "[INFO] TRAINER_IS_RESUME=${TRAINER_IS_RESUME}"
 echo "[INFO] PRETRAINED_CHECKPOINT=${PRETRAINED_CHECKPOINT}"
-echo "[INFO] NUM_WARMUP_STEPS=${NUM_WARMUP_STEPS}"
-echo "[INFO] ACTION_GOAL_LANG_PROB=${ACTION_GOAL_LANG_PROB}"
+echo "[INFO] NUM_WARMUP_STEPS=${NUM_WARMUP_STEPS:-<yaml>}"
+echo "[INFO] ACTION_GOAL_LANG_PROB=${ACTION_GOAL_LANG_PROB:-<yaml>}"
 echo "[INFO] SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT}"
 
 if ! srun --jobid "${SLURM_JOB_ID}" --ntasks "${SLURM_NNODES}" --ntasks-per-node=1 bash --noprofile --norc -c '
@@ -316,12 +334,6 @@ accelerate launch \
   --datasets.vla_data.prefetch_factor 1 \
   --datasets.vla_data.persistent_workers false \
   --trainer.gradient_accumulation_steps "${GRAD_ACCUM}" \
-  --trainer.max_train_steps "${MAX_TRAIN_STEPS}" \
-  --trainer.num_warmup_steps "${NUM_WARMUP_STEPS}" \
-  --framework.mgv.action_goal_lang_prob "${ACTION_GOAL_LANG_PROB}" \
-  --trainer.save_interval "${SAVE_INTERVAL}" \
-  --trainer.logging_frequency "${LOGGING_FREQUENCY}" \
-  --trainer.eval_interval "${EVAL_INTERVAL}" \
   --trainer.is_resume "${TRAINER_IS_RESUME}" \
   --run_root_dir "${RUN_ROOT_DIR}" \
   --run_id "${RUN_ID}" \

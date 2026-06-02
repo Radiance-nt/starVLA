@@ -118,9 +118,15 @@ bash examples/LIBERO/data_preparation.sh
 
 Most of the required training files have been organized in [train_files](train_files).  
 
-Please run the following command to start training:
+默认 baseline 训练直接运行：
 
 ```bash
 bash examples/LIBERO/train_files/run_libero_train.sh
 ```
-⚠️ **Note:** Please ensure that you specify the correct path in `examples/LIBERO/train_files/run_libero_train.sh`
+
+切到当前 MGV 配置时，可以直接覆盖 `CONFIG_YAML`：
+
+```bash
+CONFIG_YAML=examples/LIBERO/train_files/starvla_cotrain_libero_mgv.yaml \
+bash examples/LIBERO/train_files/run_libero_train.sh
+```

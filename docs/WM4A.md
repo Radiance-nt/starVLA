@@ -80,22 +80,21 @@ This script:
 
 ### Recommended: LIBERO with CosmoPredict2OFT
 
-The simplest way to train a WM4A model is with the OFT (MLP) action head on
-the LIBERO benchmark:
+The simplest way to train a WM4A model is with the LIBERO launcher script:
 
 ```bash
 # From the starVLA project root
 bash examples/LIBERO/train_files/run_libero_train.sh
 ```
 
-Before running, edit the script to set your local paths:
+Before running, override the key environment variables as needed:
 
 ```bash
-Framework_name=CosmoPredict2OFT          # or CosmoPredict2GR00T, WanOFT, etc.
-base_wm=nvidia/Cosmos-Predict2-2B-Video2World>  # still needed for tokenizer/processor
-config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
-libero_data_root=<path_to_LIBERO_dataset>
-data_mix=libero_all                       # or libero_goal
+FRAMEWORK_NAME=CosmoPredict2OFT \
+CONFIG_YAML=examples/LIBERO/train_files/starvla_cotrain_libero.yaml \
+LIBERO_DATA_ROOT=<path_to_LIBERO_dataset> \
+DATA_MIX=libero_goal \
+bash examples/LIBERO/train_files/run_libero_train.sh
 ```
 
 Key training arguments:

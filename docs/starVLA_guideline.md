@@ -224,35 +224,33 @@ trainer:
 
 ## 5. Understanding the Training Script
 
-The training script [`examples/LIBERO/train_files/run_libero_train.sh`](../examples/LIBERO/train_files/run_libero_train.sh) wraps around `accelerate launch`. Key variables to customize:
+The training script [`examples/LIBERO/train_files/run_libero_train.sh`](../examples/LIBERO/train_files/run_libero_train.sh) is the user-facing launcher. It delegates to the clean-checked Slurm watcher and accepts the following environment overrides:
 
 ```bash
-###########################################################################################
-# === Modify these for your environment ===
-Framework_name=QwenOFT              # QwenOFT | QwenFAST | QwenPI | QwenGR00T
-freeze_module_list=''               # e.g. 'qwen_vl' to freeze VLM backbone
-base_vlm=playground/Pretrained_models/Qwen3-VL-4B-Instruct
-config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
-libero_data_root=playground/Datasets/LEROBOT_LIBERO_DATA
-data_mix=libero_all                 # or libero_goal for single suite
-run_root_dir=./results/Checkpoints
-run_id=my_first_libero_run          # unique experiment name
-###########################################################################################
+FRAMEWORK_NAME=QwenOFT
+CONFIG_YAML=examples/LIBERO/train_files/starvla_cotrain_libero.yaml
+LIBERO_DATA_ROOT=playground/Datasets/LEROBOT_LIBERO_DATA
+DATA_MIX=libero_goal
+RUN_ROOT_DIR=/mnt/petrelfs/linzhanhui/runs_inspect/starVLA
+RUN_ID=my_first_libero_run
+PER_DEVICE_BS=4
+GRAD_ACCUM=2
+MAX_TRAIN_STEPS=50000
+NUM_WARMUP_STEPS=5000
 ```
 
-The script launches distributed training with DeepSpeed ZeRO-2:
+The default launcher path is:
 
 ```bash
-accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes 8 \                    # number of GPUs
-  starVLA/training/train_starvla.py \
-  --config_yaml ${config_yaml} \
-  --framework.name ${Framework_name} \
-  ...
+bash examples/LIBERO/train_files/run_libero_train.sh
 ```
 
-> **Note:** Command-line arguments override YAML config values. This lets you keep one base config and vary parameters per experiment.
+For the current MGV config, swap only the YAML:
+
+```bash
+CONFIG_YAML=examples/LIBERO/train_files/starvla_cotrain_libero_mgv.yaml \
+bash examples/LIBERO/train_files/run_libero_train.sh
+```
 
 ---
 

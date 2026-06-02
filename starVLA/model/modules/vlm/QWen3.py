@@ -8,6 +8,7 @@ import torch
 from starVLA.training.trainer_utils import initialize_overwatch
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from .token_utils import ensure_additional_special_tokens as _ensure_additional_special_tokens
 
 logger = initialize_overwatch(__name__)
 
@@ -78,6 +79,17 @@ class _QWen3_VL_Interface(nn.Module):
         if "-Action" in model_id:
             self._ACTION_TOKEN_MIN = _ACTION_TOKEN_MIN
             self._ACTION_TOKEN_MAX = _ACTION_TOKEN_MAX
+        self.added_special_token_id_map = {}
+
+    def ensure_additional_special_tokens(self, tokens: list[str], init_strategy: str = "normal") -> dict[str, int]:
+        mapping = _ensure_additional_special_tokens(
+            model=self.model,
+            tokenizer=self.processor.tokenizer,
+            tokens=tokens,
+            init_strategy=init_strategy,
+        )
+        self.added_special_token_id_map.update(mapping)
+        return mapping
 
     def forward(
         self,

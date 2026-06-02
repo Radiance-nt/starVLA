@@ -30,9 +30,6 @@ from PIL import Image
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.model.tools import FRAMEWORK_REGISTRY
-from starVLA.training.trainer_utils import initialize_overwatch
-
-logger = initialize_overwatch(__name__)
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
@@ -40,9 +37,9 @@ IGNORE_INDEX = -100
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import add_discretized_state_to_instruction, merge_framework_config
 from starVLA.model.modules.action_model.MLP_ActionHeader import get_action_model
+from starVLA.model.modules.mgv_progress import MGVProgressModule
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.training.trainer_utils.trainer_tools import resize_images
-
 
 # ──────────────────────────────────────────────────────────────────────
 #  Default Config for QwenOFT
@@ -87,6 +84,28 @@ class QwenOFTDefaultConfig:
         }
     )
 
+    mgv: dict = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "proj_dim": 512,
+            "gamma": 0.99,
+            "lambda_mgv": 1.0,
+            "use_language_goal": True,
+            "state_start_token": "<state_start>",
+            "state_end_token": "<state_end>",
+            "goal_img_start_token": "<goal_img_start>",
+            "goal_lang_start_token": "<goal_lang_start>",
+            "goal_img_end_token": "<goal_img_end>",
+            "goal_lang_end_token": "<goal_lang_end>",
+            "value_token": "<value>",
+            "mgv_forward_interval": 1,
+            "batch_consistent_action_goal": False,
+            "action_goal_lang_prob": 0.8,
+            "eta_distill": 0.05,
+            "use_terminal_goal": True,
+        }
+    )
+
 
 @FRAMEWORK_REGISTRY.register("QwenOFT")
 class Qwenvl_OFT(baseframework):
@@ -120,6 +139,7 @@ class Qwenvl_OFT(baseframework):
         # align action_hidden_dim to VLM hidden_size at runtime
         self.config.framework.action_model.action_hidden_dim = self.qwen_vl_interface.model.config.hidden_size
         self.action_model = get_action_model(config=self.config)
+        self.hidden_size = self.qwen_vl_interface.model.config.hidden_size
 
         # `action_horizon` is the single source of truth for chunk length.
         # Legacy aliases (`future_action_window_size`, `past_action_window_size`)
@@ -134,81 +154,103 @@ class Qwenvl_OFT(baseframework):
 
         # L1 loss
         self.l1_loss = nn.L1Loss()
+        self.mgv_module = MGVProgressModule(
+            qwen_vl_interface=self.qwen_vl_interface,
+            hidden_size=self.hidden_size,
+            mgv_cfg=self.config.framework.get("mgv", {}),
+            state_instruction_builder=self.add_discretized_state_to_instruction,
+        )
+        self.mgv_enabled = self.mgv_module.enabled
 
     def forward(
         self,
         examples: List[dict] = None,
+        current_step: Optional[int] = None,
+        forward_mode: str = "action",
         **kwargs,
     ) -> Tuple:
-        """
-        Training forward: directly regress future actions (no diffusion).
+        """Dispatch training forwards for action-only or mgv-only execution."""
+        if forward_mode == "action":
+            return self._forward_action_training(examples)
+        if forward_mode == "mgv":
+            return self._forward_mgv_training(examples)
+        raise ValueError(f"Unsupported forward_mode `{forward_mode}`. Expected action or mgv.")
 
-        Flow:
-          1. Build QwenVL inputs (images + instruction tokens)
-          2. Extract hidden states from configured layer range
-          7. Predict action and compute L1 loss
-
-        Args:
-            examples: List[dict], each dict requires:
-                - image: List[PIL.Image] (multi-view)
-                - lang: str instruction
-                - action: np.ndarray or list shaped [T, action_dim]
-            **kwargs: Reserved.
-
-        Returns:
-            dict:
-                action_loss (torch.Tensor): Scalar diffusion noise prediction loss.
-        """
-        batch_images = [example["image"] for example in examples]  #  [B，[PLT]]
-        instructions = [example["lang"] for example in examples]  # [B, str]
-        actions = [example["action"] for example in examples]  # label [B， len, 7]
-        state = (
-            [example["state"] for example in examples] if "state" in examples[0] else None
-        )  # List[ndarray (1, state_dim)] or None
-
-        # Optionally prepend discretised proprioceptive state tokens to each instruction (π₀.5 style).
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
-
-        # step 0: add special action token to instruction
-        action_tokens = (
-            self.action_token * self.chunk_len
-        )  # can't add " " between two tokens, otherwise will be tokenized to multiple tokens
-        prompt_suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{action_tokens}<action>."
-        instructions = [instruction + prompt_suffix for instruction in instructions]
-
-        # Step 1: QWenVL input format
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
+    def _require_example_keys(self, examples: List[dict], required_keys: List[str], context: str) -> None:
+        missing_keys = [key for key in required_keys if key not in examples[0]]
+        if missing_keys:
+            raise ValueError(
+                f"{context} is enabled but the batch is missing required keys {missing_keys}. "
+                "Set datasets.vla_data.return_mgv_samples=true."
             )
-            # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
 
-        # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
-            # Extract action token embeddings as action prediction queries
+    def _forward_action_training(self, examples: List[dict]) -> dict:
+        actions = [example["action"] for example in examples]  # label [B， len, 7]
+
+        if self.mgv_enabled:
+            required_action_keys = ["state_obs", "image_goal_obs"]
+            self._require_example_keys(examples, required_action_keys, "MGV action conditioning")
+            qwen_inputs, input_ids = self.mgv_module.build_action_training_inputs(
+                examples=examples,
+                chunk_len=self.chunk_len,
+                action_token=self.action_token,
+            )
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                qwenvl_outputs = self.qwen_vl_interface(
+                    **qwen_inputs,
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                last_hidden = qwenvl_outputs.hidden_states[-1]
+        else:
+            batch_images = [example["image"] for example in examples]  # [B, [PIL]]
+            instructions = [example["lang"] for example in examples]  # [B, str]
+            state = [example["state"] for example in examples] if "state" in examples[0] else None
+            base_instructions = self._build_base_instructions(instructions, state)
+            model_instructions = self._append_action_prompt(base_instructions)
+
+            # Step 1: QWenVL input format
+            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=model_instructions)
             input_ids = qwen_inputs.get("input_ids", None)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                qwenvl_outputs = self.qwen_vl_interface(
+                    **qwen_inputs,
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                # last_hidden_state: [B, seq_len, H]
+                last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
+
+        with torch.autocast("cuda", dtype=torch.float32):
             action_queries = self._gather_action_token_embeddings(
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
 
-            # Label alignment: take the last chunk_len segment
-            actions = torch.tensor(
-                np.array(actions), device=pred_actions.device, dtype=pred_actions.dtype
-            )  # [B, T_full, action_dim]
-            actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
+            has_actions = "action" in examples[0] and examples[0]["action"] is not None
+            if has_actions:
+                actions = torch.tensor(
+                    np.array(actions), device=pred_actions.device, dtype=pred_actions.dtype
+                )  # [B, T_full, action_dim]
+                actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
+                action_loss = self.l1_loss(pred_actions, actions_target)
+            else:
+                action_loss = pred_actions.new_zeros(())
 
-            # Compute L1 loss
-            action_loss = self.l1_loss(pred_actions, actions_target)
+            return {"action_loss": action_loss, "L_act": action_loss, "total_loss": action_loss}
 
-        return {"action_loss": action_loss}
+    def _forward_mgv_training(self, examples: List[dict]) -> dict:
+        if not self.mgv_enabled:
+            raise RuntimeError("forward_mode=`mgv` requires framework.mgv.enabled=true.")
+        required_mgv_keys = ["state_obs", "image_goal_obs"]
+        if self.mgv_module.use_terminal_goal:
+            required_mgv_keys.append("terminal_goal_obs")
+        self._require_example_keys(examples, required_mgv_keys, "MGV")
+        mgv_metrics = self.mgv_module.compute_loss(examples)
+        mgv_metrics["total_loss"] = self.mgv_module.lambda_mgv * mgv_metrics["_loss_mgv_local"]
+        return mgv_metrics
 
     @torch.inference_mode()
     def predict_action(
@@ -235,38 +277,45 @@ class Qwenvl_OFT(baseframework):
             [example["state"] for example in examples] if "state" in examples[0] else None
         )  # List[ndarray (1, state_dim)] or None
 
-        # Optionally prepend discretised proprioceptive state tokens to each instruction (π₀.5 style).
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
-
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
-        # step 0: add special action token to instruction
-        action_tokens = (
-            self.action_token * self.chunk_len
-        )  # can't add " " between two tokens, otherwise will be tokenized to multiple tokens
-        prompt_suffix = f" Please predict the next {self.chunk_len} robot actions: <action>{action_tokens}<action>."
-        instructions = [instruction + prompt_suffix for instruction in instructions]
-
-        # Step 1: QWenVL input format
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
+        if self.mgv_enabled:
+            packed_examples = [{**example, "image": image} for example, image in zip(examples, batch_images)]
+            qwen_inputs, input_ids = self.mgv_module.build_action_inference_inputs(
+                examples=packed_examples,
+                chunk_len=self.chunk_len,
+                action_token=self.action_token,
             )
-            # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                qwenvl_outputs = self.qwen_vl_interface(
+                    **qwen_inputs,
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                last_hidden = qwenvl_outputs.hidden_states[-1]
+        else:
+            base_instructions = self._build_base_instructions(instructions, state)
+            model_instructions = self._append_action_prompt(base_instructions)
+
+            # Step 1: QWenVL input format
+            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=model_instructions)
+            input_ids = qwen_inputs.get("input_ids", None)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                qwenvl_outputs = self.qwen_vl_interface(
+                    **qwen_inputs,
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                # last_hidden_state: [B, seq_len, H]
+                last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             # Extract action token embeddings as action prediction queries
-            input_ids = qwen_inputs.get("input_ids", None)
             action_queries = self._gather_action_token_embeddings(
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
@@ -274,6 +323,16 @@ class Qwenvl_OFT(baseframework):
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
+
+    @torch.inference_mode()
+    def compute_reachability(self, example: dict) -> dict:
+        obs_payload = {
+            "image": to_pil_preserve(example["image"]),
+        }
+        if "state" in example:
+            obs_payload["state"] = example["state"]
+        reachability = self.mgv_module.compute_reachability(obs_payload, example["lang"])
+        return {"reachability": float(reachability.item())}
 
     def _gather_action_token_embeddings(
         self,
@@ -328,6 +387,17 @@ class Qwenvl_OFT(baseframework):
         expanded_index = selected_pos.unsqueeze(-1).expand(-1, -1, H)  # [B, chunk_len, H]
         action_queries = last_hidden.gather(dim=1, index=expanded_index)  # [B, chunk_len, H]
         return action_queries
+
+    def _build_base_instructions(self, instructions: List[str], state: Optional[List[np.ndarray]]) -> List[str]:
+        return self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
+
+    def _append_action_prompt(self, instructions: List[str]) -> List[str]:
+        action_tokens = self.action_token * self.chunk_len
+        prompt_suffix = (
+            f" Please predict the next {self.chunk_len} robot actions: "
+            f"<action>{action_tokens}<action>."
+        )
+        return [instruction + prompt_suffix for instruction in instructions]
 
     # Discretised state → instruction prefix (π₀.5 style); shared with QwenPI_v3.
     add_discretized_state_to_instruction = staticmethod(add_discretized_state_to_instruction)

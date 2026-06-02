@@ -1,0 +1,97 @@
+run_id: qwenoft_libero_mgv
+run_root_dir: results/Checkpoints
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: llavavla
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2048
+
+  action_model:
+    action_model_type: MLP
+    action_dim: 7
+    action_horizon: 8
+
+  mgv:
+    enabled: true
+    proj_dim: 512
+    gamma: 0.99
+    lambda_mgv: 1.0
+    use_language_goal: true
+    token_init_strategy: normal
+    state_start_token: <state_start>
+    state_end_token: <state_end>
+    goal_img_start_token: <goal_img_start>
+    goal_lang_start_token: <goal_lang_start>
+    goal_img_end_token: <goal_img_end>
+    goal_lang_end_token: <goal_lang_end>
+    value_token: <value>
+    mgv_forward_interval: 5
+    batch_consistent_action_goal: true
+    action_goal_lang_prob: 0.8
+    eta_distill: 0.05
+    use_terminal_goal: true
+    enable_distill_term_to_lang: true
+    enable_distill_lang_to_term: false
+
+datasets:
+  vlm_data:
+    dataset_py: vlm_datasets
+    dataformat: llava_json
+    dataset_use: sharegpt4v_coco
+    eval_dataset: sharegpt4v_coco
+    data_flatten: false
+    base_interval: 2
+    max_pixels: 307200
+    min_pixels: 784
+    model_max_length: 2048
+    model_type: qwen2.5vl
+    per_device_batch_size: 4
+
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: false
+    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
+    data_mix: libero_goal
+    action_type: delta_qpos
+    sequential_step_sampling: false
+    per_device_batch_size: 4
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+    return_mgv_samples: true
+    mgv_temporal_stride: 1
+
+trainer:
+  max_train_steps: 62500
+  num_warmup_steps: 6250
+  save_interval: 5000
+  eval_interval: 1000
+  learning_rate:
+    base: 1.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: ""
+  loss_scale:
+    vla: 1.0
+    vlm: 0.1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 20
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

@@ -609,7 +609,6 @@ class LeRobotSingleDataset(Dataset):
             self.tag = embodiment_tag.value
         else:
             self.tag = embodiment_tag
-
         self._init_action_mode()
         self._metadata = self._get_metadata(EmbodimentTag(self.tag))
 
@@ -627,6 +626,7 @@ class LeRobotSingleDataset(Dataset):
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
+        self._mgv_sampling_enabled = self._is_mgv_sampling_enabled()
         self._all_steps = self._get_all_steps()
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
@@ -944,7 +944,6 @@ class LeRobotSingleDataset(Dataset):
                                 "chunk_index": int(episode[chunk_col]),
                                 "file_index": int(episode[file_col]),
                             }
-                    print(video_file_indices)
                     episode_meta = {
                         "data/chunk_index": episode["data/chunk_index"],
                         "data/file_index": episode["data/file_index"],
@@ -1026,6 +1025,7 @@ class LeRobotSingleDataset(Dataset):
         config_dict = {
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
+            "mgv_sampling_enabled": self._mgv_sampling_enabled,
         }
         # Create a hash of the configuration
         config_str = str(sorted(config_dict.items()))
@@ -1040,6 +1040,39 @@ class LeRobotSingleDataset(Dataset):
         
         # Check if language modality is configured
         has_language_modality = 'language' in self.modality_keys and len(self.modality_keys['language']) > 0
+        can_fast_path_v3 = self._lerobot_version == "v3.0" and not self.delete_pause_frame
+
+        if can_fast_path_v3:
+            if has_language_modality:
+                task_df = self._tasks
+                if "task" in task_df.columns:
+                    task_series = task_df["task"].astype(str).str.strip()
+                    if (task_series == "").any():
+                        can_fast_path_v3 = False
+                else:
+                    can_fast_path_v3 = False
+
+        if can_fast_path_v3:
+            for trajectory_id, trajectory_length in tqdm(
+                zip(self.trajectory_ids, self.trajectory_lengths),
+                total=len(self.trajectory_ids),
+                desc="Getting All Step",
+            ):
+                processed_trajectories += 1
+                valid_num_steps = int(trajectory_length)
+                if self._mgv_sampling_enabled:
+                    temporal_stride = self._get_mgv_temporal_stride()
+                    valid_num_steps = max(int(trajectory_length) - temporal_stride, 0)
+                for base_index in range(valid_num_steps):
+                    all_steps.append((trajectory_id, base_index))
+
+            print(
+                f"Single-process summary: Processed {processed_trajectories} trajectories, "
+                f"skipped {skipped_trajectories} empty trajectories"
+            )
+            print(f"Total steps: {len(all_steps)} from {len(self.trajectory_ids)} trajectories")
+            return all_steps
+
         # TODO why trajectory_length here, why not use data length?
         for trajectory_id, trajectory_length in tqdm(zip(self.trajectory_ids, self.trajectory_lengths), total=len(self.trajectory_ids), desc="Getting All Step"):
             try:
@@ -1070,7 +1103,12 @@ class LeRobotSingleDataset(Dataset):
             if not trajectory_skipped:
                 processed_trajectories += 1
         
-            for base_index in range(trajectory_length):
+            valid_num_steps = int(trajectory_length)
+            if self._mgv_sampling_enabled:
+                temporal_stride = self._get_mgv_temporal_stride()
+                valid_num_steps = max(int(trajectory_length) - temporal_stride, 0)
+
+            for base_index in range(valid_num_steps):
                 all_steps.append((trajectory_id, base_index))
                 
         # Print summary statistics
@@ -1194,6 +1232,14 @@ class LeRobotSingleDataset(Dataset):
             for key in config.modality_keys:
                 delta_indices[key] = np.array(config.delta_indices)
         return delta_indices
+
+    def _is_mgv_sampling_enabled(self) -> bool:
+        if self.data_cfg is None:
+            return False
+        return bool(
+            self.data_cfg.get("return_mgv_samples", False) not in [False, "False", None]
+            or self.data_cfg.get("mgv_enabled", False) not in [False, "False", None]
+        )
 
     def _init_action_mode(self) -> None:
         if self.data_cfg is None:
@@ -1366,17 +1412,137 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        return self._pack_sample(data, trajectory_id=trajectory_id, base_index=base_index)
 
-    def _pack_sample(self, data: dict) -> dict:
-        """Pack transformed modality data into training sample format."""
+    def _set_current_trajectory_cache(self, trajectory_id: int, trajectory_data: pd.DataFrame) -> pd.DataFrame:
+        """Cache the active trajectory so repeated step reads in one sample reuse the same parquet slice."""
+        self.curr_traj_id = trajectory_id
+        self.curr_traj_data = trajectory_data
+        return trajectory_data
+
+    def _build_step_images(self, data: dict) -> list[Image.Image]:
+        """Convert transformed multi-view arrays into resized PIL images."""
         step_images = []
         for video_key in self.modality_keys["video"]:
             image = data[video_key][0]
             image = Image.fromarray(image).resize((224, 224))
             step_images.append(image)
+        return step_images
 
+    def _has_language_modality(self) -> bool:
+        return "language" in self.modality_keys and len(self.modality_keys["language"]) > 0
+
+    def _extract_language(self, data: dict) -> str:
+        if not self._has_language_modality():
+            return ""
         language = data[self.modality_keys["language"][0]][0]
+        return language if isinstance(language, str) else str(language)
+
+    def _include_state_in_sample(self) -> bool:
+        return self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]
+
+    def _extract_state(self, data: dict) -> np.ndarray | None:
+        if not self._include_state_in_sample() or "state" not in self.modality_keys:
+            return None
+
+        state = []
+        for state_key in self.modality_keys["state"]:
+            state.append(data[state_key])
+        return np.concatenate(state, axis=1).astype(np.float16)
+
+    def _build_obs_payload(self, data: dict) -> dict:
+        obs_payload = {"image": self._build_step_images(data)}
+        state = self._extract_state(data)
+        if state is not None:
+            obs_payload["state"] = state
+        return obs_payload
+
+    def _sample_uniform_future_delta(
+        self,
+        max_future_steps: int,
+        rng: np.random.Generator | None = None,
+    ) -> int:
+        """Sample a single future offset uniformly from {1, ..., max_future_steps}."""
+        if max_future_steps <= 0:
+            return 0
+
+        if rng is None:
+            rng = np.random.default_rng()
+
+        return int(rng.integers(1, max_future_steps + 1))
+
+    def _get_mgv_temporal_stride(self) -> int:
+        stride = 1
+        if self.data_cfg is not None:
+            stride = int(self.data_cfg.get("mgv_temporal_stride", stride))
+        return max(stride, 1)
+
+    def _sample_mgv_goal_index(self, trajectory_id: int, base_index: int) -> int:
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        traj_len = int(self.trajectory_lengths[trajectory_index])
+        temporal_stride = self._get_mgv_temporal_stride()
+        min_traj_len = temporal_stride + 1
+        if traj_len < min_traj_len:
+            raise ValueError(
+                f"MGV requires trajectory length >= {min_traj_len}, got {traj_len} for trajectory {trajectory_id}."
+            )
+
+        max_base_index = traj_len - 1 - temporal_stride
+        if base_index > max_base_index:
+            raise ValueError(
+                f"MGV base index must be <= {max_base_index}, got {base_index} "
+                f"for trajectory {trajectory_id} with length {traj_len}."
+            )
+
+        seed = safe_hash((self.epoch, int(trajectory_id), int(base_index), "mgv"))
+        rng = np.random.default_rng(seed)
+        # Sample the future image goal on stride-level support
+        # {k + stride, k + 2*stride, ...}.
+        max_future_steps = (traj_len - 1 - base_index) // temporal_stride
+        sampled_delta = self._sample_uniform_future_delta(max_future_steps, rng=rng)
+        macro_delta = max(sampled_delta, 1)
+        goal_index = min(base_index + temporal_stride * macro_delta, traj_len - 1)
+        return goal_index
+
+    def _build_mgv_observation_payload(self, trajectory_id: int, base_index: int) -> dict:
+        raw_data = self.get_step_data(trajectory_id, base_index)
+        data = self.transforms(raw_data)
+        return self._build_obs_payload(data)
+
+    def _attach_mgv_sample(
+        self,
+        sample: dict,
+        trajectory_id: int,
+        base_index: int,
+        language: str,
+    ) -> None:
+        goal_index = self._sample_mgv_goal_index(trajectory_id, base_index)
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        traj_len = int(self.trajectory_lengths[trajectory_index])
+
+        sample["state_obs"] = {
+            "image": sample["image"],
+            **({"state": sample["state"]} if "state" in sample else {}),
+        }
+        sample["image_goal_obs"] = self._build_mgv_observation_payload(trajectory_id, goal_index)
+        sample["terminal_goal_obs"] = self._build_mgv_observation_payload(trajectory_id, traj_len - 1)
+        sample["language_goal"] = language if language.strip() else None
+        sample["has_language"] = bool(language.strip())
+        sample["has_actions"] = "action" in sample
+        sample["metadata"] = {
+            "trajectory_id": int(trajectory_id),
+            "k": int(base_index),
+            "h": int(goal_index),
+            "T": int(traj_len - 1),
+            "traj_len": traj_len,
+            "mgv_temporal_stride": self._get_mgv_temporal_stride(),
+        }
+
+    def _pack_sample(self, data: dict, trajectory_id: int | None = None, base_index: int | None = None) -> dict:
+        """Pack transformed modality data into training sample format."""
+        step_images = self._build_step_images(data)
+
+        language = self._extract_language(data)
         action = []
         for action_key in self.modality_keys["action"]:
             action.append(data[action_key])
@@ -1389,12 +1555,13 @@ class LeRobotSingleDataset(Dataset):
             "robot_tag": self.tag
         }
 
-        if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
-            state = []
-            for state_key in self.modality_keys["state"]:
-                state.append(data[state_key])
-            state = np.concatenate(state, axis=1).astype(np.float16)
+        state = self._extract_state(data)
+        if state is not None:
             sample["state"] = state
+
+        if trajectory_id is not None and base_index is not None:
+            if self._mgv_sampling_enabled:
+                self._attach_mgv_sample(sample, trajectory_id=trajectory_id, base_index=base_index, language=language)
 
         return sample
 
@@ -1425,8 +1592,9 @@ class LeRobotSingleDataset(Dataset):
             }
         """
         data = {}
-        # Get the data for all modalities # just for action base data
-        self.curr_traj_data = self.get_trajectory_data(trajectory_id)
+        # Keep the current trajectory cached so future frame lookups within the same
+        # sample do not re-read the parquet file.
+        self._set_current_trajectory_cache(trajectory_id, self.get_trajectory_data(trajectory_id))
         # TODO @JinhuiYE The logic below is poorly implemented. Data reading should be directly based on curr_traj_data.
         for modality in self.modality_keys:
             # Get the data corresponding to each key in the modality
@@ -1447,7 +1615,7 @@ class LeRobotSingleDataset(Dataset):
                     episode_chunk=chunk_index, episode_index=trajectory_id
                 )
                 assert parquet_path.exists(), f"Parquet file not found at {parquet_path}"
-                return pd.read_parquet(parquet_path)
+                return self._set_current_trajectory_cache(trajectory_id, pd.read_parquet(parquet_path))
         elif self._lerobot_version == "v3.0":
             return self.get_trajectory_data_lerobot_v3(trajectory_id)
     
@@ -1470,7 +1638,7 @@ class LeRobotSingleDataset(Dataset):
             
             # filter by trajectory_id
             episode_data = file_data.loc[file_data["episode_index"] == trajectory_id].copy()
-            return episode_data
+            return self._set_current_trajectory_cache(trajectory_id, episode_data)
 
 
     def get_trajectory_index(self, trajectory_id: int) -> int:
@@ -2160,6 +2328,13 @@ class LeRobotMixtureDataset(Dataset):
         self.seed = seed
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
+        self._mgv_sampling_enabled = bool(
+            self.data_cfg is not None
+            and (
+                self.data_cfg.get("return_mgv_samples", False) not in [False, "False", None]
+                or self.data_cfg.get("mgv_enabled", False) not in [False, "False", None]
+            )
+        )
 
         # Set properties for sampling
 
@@ -2193,13 +2368,20 @@ class LeRobotMixtureDataset(Dataset):
         self._trajectory_sampling_weights: list[np.ndarray] = []
         for i, dataset in enumerate(self.datasets):
             trajectory_sampling_weights = np.ones(len(dataset.trajectory_lengths))
+            valid_mask = None
             if self.balance_trajectory_weights:
                 trajectory_sampling_weights *= dataset.trajectory_lengths
+            if self._mgv_sampling_enabled:
+                temporal_stride = dataset._get_mgv_temporal_stride()
+                valid_mask = dataset.trajectory_lengths >= (temporal_stride + 1)
+                trajectory_sampling_weights = trajectory_sampling_weights * valid_mask.astype(np.float64)
             
             # Check for zero or negative weights before normalization
-            if np.any(trajectory_sampling_weights <= 0):
+            if np.any(trajectory_sampling_weights < 0):
                 print(f"Warning: Dataset {i} has zero or negative trajectory weights")
                 trajectory_sampling_weights = np.maximum(trajectory_sampling_weights, 1e-8)
+            elif np.any(trajectory_sampling_weights == 0) and (valid_mask is None or not np.any(valid_mask)):
+                print(f"Warning: Dataset {i} has no valid trajectories for the current sampling mode")
             
             # Normalize weights
             weights_sum = trajectory_sampling_weights.sum()
@@ -2298,6 +2480,25 @@ class LeRobotMixtureDataset(Dataset):
         dataset_index = rng.choice(len(self.datasets), p=self.dataset_sampling_weights)
         dataset = self.datasets[dataset_index]
 
+        if self._sequential_step_sampling:
+            if len(dataset.all_steps) == 0:
+                raise ValueError(f"Dataset {dataset.dataset_name} has no steps.")
+
+            step_pos = self._step_pos[dataset_index]
+            if step_pos >= len(dataset.all_steps):
+                order = np.arange(len(dataset.all_steps))
+                if self.mode == "train":
+                    seed = safe_hash((self.epoch, dataset_index, self.seed, step_pos))
+                    rng = np.random.default_rng(seed)
+                    rng.shuffle(order)
+                self._step_order[dataset_index] = order
+                step_pos = 0
+
+            single_step_index = self._step_order[dataset_index][step_pos]
+            self._step_pos[dataset_index] = step_pos + 1
+            trajectory_id, base_index = dataset.all_steps[single_step_index]
+            return dataset, trajectory_id, base_index
+
         # Sample trajectory
         trajectory_index = rng.choice(
             len(dataset.trajectory_ids), p=self.trajectory_sampling_weights[dataset_index]
@@ -2305,7 +2506,16 @@ class LeRobotMixtureDataset(Dataset):
         trajectory_id = dataset.trajectory_ids[trajectory_index]
 
         # Sample step
-        base_index = rng.choice(dataset.trajectory_lengths[trajectory_index])
+        max_num_steps = int(dataset.trajectory_lengths[trajectory_index])
+        if self._mgv_sampling_enabled:
+            temporal_stride = dataset._get_mgv_temporal_stride()
+            max_num_steps = max(max_num_steps - temporal_stride, 0)
+        if max_num_steps <= 0:
+            raise ValueError(
+                f"Unable to sample a valid step for trajectory {trajectory_id} "
+                f"(length={int(dataset.trajectory_lengths[trajectory_index])}) under current sampling mode."
+            )
+        base_index = int(rng.choice(max_num_steps))
         return dataset, trajectory_id, base_index
 
     
@@ -2351,9 +2561,9 @@ class LeRobotMixtureDataset(Dataset):
                         break
                     index = random.randint(0, len(self) - 1)
                     
-                raw_data = dataset.get_step_data(trajectory_id, step)    
+                raw_data = dataset.get_step_data(trajectory_id, step)
                 data = dataset.transforms(raw_data)
-                sample = dataset._pack_sample(data)
+                sample = dataset._pack_sample(data, trajectory_id=trajectory_id, base_index=step)
                 
                 return sample
                 
@@ -2617,20 +2827,47 @@ class LeRobotMixtureDataset(Dataset):
 
         self.tag = EmbodimentTag.NEW_EMBODIMENT.value
         self.merged_metadata: dict[str, DatasetMetadata] = {}
-        # Group metadata by tag
-        all_metadatas: dict[str, list[DatasetMetadata]] = {}
+        self._dataset_merged_tags: dict[int, str] = {}
+
+        datasets_by_base_tag: dict[str, list] = {}
         for dataset in self.datasets:
-            if dataset.tag not in all_metadatas:
-                all_metadatas[dataset.tag] = []
-            all_metadatas[dataset.tag].append(dataset.metadata)
-        for tag, metadatas in all_metadatas.items():
-            self.merged_metadata[tag] = self.merge_metadata(
-                metadatas=metadatas,
-                dataset_sampling_weights=self.dataset_sampling_weights.tolist(),
-                percentile_mixing_method=metadata_config["percentile_mixing_method"],
+            datasets_by_base_tag.setdefault(dataset.tag, []).append(dataset)
+
+        for base_tag, tagged_datasets in datasets_by_base_tag.items():
+            schema_groups: dict[str, list] = {}
+            for dataset in tagged_datasets:
+                schema_signature = json.dumps(
+                    dataset.metadata.modalities.model_dump(mode="json"),
+                    sort_keys=True,
+                )
+                schema_groups.setdefault(schema_signature, []).append(dataset)
+
+            if len(schema_groups) == 1:
+                group_tag = base_tag
+                merged_datasets = tagged_datasets
+                self.merged_metadata[group_tag] = self.merge_metadata(
+                    metadatas=[dataset.metadata for dataset in merged_datasets],
+                    dataset_sampling_weights=self.dataset_sampling_weights.tolist(),
+                    percentile_mixing_method=metadata_config["percentile_mixing_method"],
+                )
+                for dataset in merged_datasets:
+                    self._dataset_merged_tags[id(dataset)] = group_tag
+                    dataset.set_transforms_metadata(self.merged_metadata[group_tag])
+                continue
+
+            print(
+                f"Detected incompatible modality schemas under embodiment tag `{base_tag}`; "
+                "splitting statistics per dataset to preserve historical normalization."
             )
-        for dataset in self.datasets:
-            dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
+            for dataset in tagged_datasets:
+                group_tag = f"{base_tag}:{dataset.dataset_name}"
+                self.merged_metadata[group_tag] = self.merge_metadata(
+                    metadatas=[dataset.metadata],
+                    dataset_sampling_weights=[1.0],
+                    percentile_mixing_method=metadata_config["percentile_mixing_method"],
+                )
+                self._dataset_merged_tags[id(dataset)] = group_tag
+                dataset.set_transforms_metadata(self.merged_metadata[group_tag])
 
     def save_dataset_statistics(self, save_path: Path | str, format: str = "json") -> None:
         """
@@ -2757,8 +2994,10 @@ class LeRobotMixtureDataset(Dataset):
         num_trajectories = 0
         
         # Count dataset information belonging to this tag
+        dataset_merged_tags = getattr(self, "_dataset_merged_tags", {})
         for dataset in self.datasets:
-            if dataset.tag == tag:
+            dataset_tag = dataset_merged_tags.get(id(dataset), dataset.tag)
+            if dataset_tag == tag:
                 num_transitions += len(dataset)
                 num_trajectories += len(dataset.trajectory_ids)
         

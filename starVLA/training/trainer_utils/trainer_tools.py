@@ -8,12 +8,18 @@ endpoints (e.g., JSONL local logs, Weights & Biases).
 from typing import Tuple
 import re
 import json
+import glob
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _is_main_process() -> bool:
+    return not dist.is_initialized() or dist.get_rank() == 0
 
 
 # === Define Tracker Interface ===
@@ -73,6 +79,17 @@ def build_param_lr_groups(model, cfg):
     frozen_params = set()
     param_groups = []
 
+    mgv_module = getattr(model, "mgv_module", None)
+    mgv_enabled = bool(getattr(model, "mgv_enabled", False))
+    mgv_local_param_ids = set()
+    if mgv_module is not None:
+        for name, param in mgv_module.named_parameters():
+            if name.startswith("qwen_vl_interface."):
+                continue
+            mgv_local_param_ids.add(id(param))
+        if not mgv_enabled:
+            frozen_params.update(mgv_local_param_ids)
+
     for freeze_path in freeze_patterns:
         module = model
         try:
@@ -91,23 +108,47 @@ def build_param_lr_groups(model, cfg):
         try:
             for attr in module_name.split("."):
                 module = getattr(module, attr)
-            # filter out frozen parameters
-            params = [p for p in module.parameters() if id(p) not in frozen_params]
+            if module_name == "action_model" and hasattr(model, "mgv_module"):
+                params = []
+                seen_local = set()
+                for p in module.parameters():
+                    pid = id(p)
+                    if not p.requires_grad or pid in seen_local or pid in frozen_params or pid in used_params:
+                        continue
+                    seen_local.add(pid)
+                    params.append(p)
+                mgv_module = getattr(model, "mgv_module")
+                if mgv_enabled:
+                    for name, p in mgv_module.named_parameters():
+                        if name.startswith("qwen_vl_interface."):
+                            continue
+                        pid = id(p)
+                        if not p.requires_grad or pid in seen_local or pid in frozen_params or pid in used_params:
+                            continue
+                        seen_local.add(pid)
+                        params.append(p)
+            else:
+                params = [
+                    p
+                    for p in module.parameters()
+                    if p.requires_grad and id(p) not in frozen_params and id(p) not in used_params
+                ]
             if params:  # only add param group if there are trainable parameters
                 param_groups.append({"params": params, "lr": lr, "name": module_name})
                 used_params.update(id(p) for p in params)
         except AttributeError:
-            ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
+            raise ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
 
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
-    other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params]
+    other_params = [
+        p
+        for p in model.parameters()
+        if p.requires_grad and id(p) not in used_params and id(p) not in frozen_params
+    ]
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
 
     return param_groups
-
-
-import torch.distributed as dist
 
 
 def only_main_process(func):
@@ -116,7 +157,7 @@ def only_main_process(func):
     """
 
     def wrapper(*args, **kwargs):
-        if dist.is_initialized() and dist.get_rank() != 0:
+        if not _is_main_process():
             return None  # non-main process does not execute
         return func(*args, **kwargs)
 
@@ -143,9 +184,6 @@ def resize_images(images, target_size=(224, 224)):
         raise ValueError("Unsupported image type or structure.")
 
 
-import torch.distributed as dist
-
-
 class TrainerUtils:
     @staticmethod
     def freeze_backbones(model, freeze_modules=""):
@@ -165,9 +203,7 @@ class TrainerUtils:
           - model:
         """
         frozen = []
-        print("#"*30)
-        print(freeze_modules)
-        if freeze_modules and type(freeze_modules) == str:
+        if freeze_modules and isinstance(freeze_modules, str):
             # split and remove whitespace
             patterns = [p.strip() for p in freeze_modules.split(",") if p.strip()] if freeze_modules else []
 
@@ -188,7 +224,7 @@ class TrainerUtils:
                     continue
 
         # accelerator.wait_for_everyone()  # synchronize when distributed training
-        if dist.get_rank == 0:
+        if _is_main_process():
             print(f"🔒 Frozen modules with re pattern: {frozen}")
         return model
 
@@ -198,7 +234,7 @@ class TrainerUtils:
         print the total number of parameters and trainable parameters of the model
         :param model: PyTorch model instance
         """
-        if dist.get_rank() != 0:
+        if not _is_main_process():
             return
         print("📊 model parameter statistics:")
         num_params = sum(p.numel() for p in model.parameters())
@@ -220,7 +256,7 @@ class TrainerUtils:
         """
         if not checkpoint_path:
             return []
-        if dist.get_rank() == 0:
+        if _is_main_process():
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
             if _is_safetensors_path(checkpoint_path):
@@ -246,7 +282,7 @@ class TrainerUtils:
                     sub_state_dict = {k[len(prefix) :]: v for k, v in checkpoint.items() if k.startswith(prefix)}
                     if sub_state_dict:
                         module.load_state_dict(sub_state_dict, strict=True)
-                        if dist.get_rank() == 0:
+                        if _is_main_process():
                             print(f"✅ parameters loaded to module '{path}'")
                         loaded_modules.append(path)
                     else:
@@ -256,7 +292,7 @@ class TrainerUtils:
         else:  # full load
             try:
                 model.load_state_dict(checkpoint, strict=False)
-                if dist.get_rank() == 0:
+                if _is_main_process():
                     print("✅ loaded <full_model> model parameters")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
@@ -468,32 +504,55 @@ class TrainerUtils:
             self.accelerator.print(f"No checkpoint directory found at {checkpoint_dir}")
             return None, 0
 
-        # Find all checkpoints matching the naming convention, supports .pt and .safetensors
-        checkpoints = [
-            f for f in os.listdir(checkpoint_dir) 
-            if re.match(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", f)
-            and os.path.isfile(os.path.join(checkpoint_dir, f))  # ensure it is a file
-        ]
+        def is_valid_state_checkpoint(entry_path):
+            pytorch_model_dir = os.path.join(entry_path, "pytorch_model")
+            if not os.path.isdir(pytorch_model_dir):
+                return False
 
-        if not checkpoints:
+            model_state_files = glob.glob(os.path.join(pytorch_model_dir, "*_model_states.pt"))
+            optim_state_files = glob.glob(os.path.join(pytorch_model_dir, "*_optim_states.pt"))
+            if not model_state_files or not optim_state_files:
+                return False
+
+            latest_path = os.path.join(entry_path, "latest")
+            return os.path.isfile(latest_path)
+
+        def is_valid_weight_checkpoint(entry_path):
+            if _is_safetensors_path(entry_path):
+                return os.path.getsize(entry_path) > 0
+
+            try:
+                torch._C.PyTorchFileReader(entry_path)
+                return True
+            except Exception as exc:
+                self.accelerator.print(
+                    f"Skipping unreadable model checkpoint: {entry_path} ({exc})"
+                )
+                return False
+
+        checkpoint_entries = []
+        for entry in os.listdir(checkpoint_dir):
+            entry_path = os.path.join(checkpoint_dir, entry)
+
+            state_match = re.match(r"steps_(\d+)_state$", entry)
+            if state_match and os.path.isdir(entry_path):
+                if is_valid_state_checkpoint(entry_path):
+                    checkpoint_entries.append((entry_path, int(state_match.group(1)), 1))
+                else:
+                    self.accelerator.print(f"Skipping incomplete state checkpoint: {entry_path}")
+                continue
+
+            weight_match = re.match(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", entry)
+            if weight_match and os.path.isfile(entry_path):
+                if is_valid_weight_checkpoint(entry_path):
+                    checkpoint_entries.append((entry_path, int(weight_match.group(1)), 0))
+
+        if not checkpoint_entries:
             self.accelerator.print(f"No checkpoints found in {checkpoint_dir}")
             return None, 0
 
-        # Extract step numbers and sort
-        try:
-            checkpoints_with_steps = [
-                (ckpt, int(re.search(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", ckpt).group(1)))
-                for ckpt in checkpoints
-            ]
-        except AttributeError as e:
-            self.accelerator.print(f"Error parsing checkpoint filenames: {e}")
-            return None, 0
-
-        # Sort by step number and get the latest checkpoint
-        checkpoints_with_steps.sort(key=lambda x: x[1])
-        latest_checkpoint, completed_steps = checkpoints_with_steps[-1]
-
-        latest_checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
+        checkpoint_entries.sort(key=lambda x: (x[1], x[2]))
+        latest_checkpoint_path, completed_steps, _ = checkpoint_entries[-1]
         self.accelerator.print(f"Latest checkpoint found: {latest_checkpoint_path}")
         return latest_checkpoint_path, completed_steps
 

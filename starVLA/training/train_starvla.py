@@ -14,6 +14,8 @@ Conventions:
 import argparse
 import json
 import os
+import re
+import shutil
 import time
 from pathlib import Path
 from typing import Tuple
@@ -23,9 +25,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
-from accelerate import Accelerator, DeepSpeedPlugin
+from accelerate import Accelerator, DeepSpeedPlugin, skip_first_batches
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import GradientAccumulationPlugin, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -38,10 +40,6 @@ from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, normalize_dotlist_args
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
-
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -51,6 +49,21 @@ logger = get_logger(__name__)
 
 def load_fast_tokenizer():
     return AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
+
+
+def build_accelerator(cfg) -> Accelerator:
+    grad_accum = int(getattr(cfg.trainer, "gradient_accumulation_steps", 1))
+    deepspeed_plugin = DeepSpeedPlugin(gradient_accumulation_steps=grad_accum)
+    grad_accum_plugin = GradientAccumulationPlugin(
+        num_steps=grad_accum,
+        sync_each_batch=True,
+    )
+    accelerator = Accelerator(
+        deepspeed_plugin=deepspeed_plugin,
+        gradient_accumulation_plugin=grad_accum_plugin,
+    )
+    accelerator.print(accelerator.state)
+    return accelerator
 
 
 def setup_directories(cfg) -> Path:
@@ -124,7 +137,6 @@ class VLATrainer(TrainerUtils):
         self._save_initial_configs()
 
         self._init_checkpointing()
-        self._adjust_lr_scheduler_for_resume()
 
         freeze_modules = (
             self.config.trainer.freeze_modules
@@ -134,12 +146,18 @@ class VLATrainer(TrainerUtils):
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         self.print_trainable_parameters(self.model)
 
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
+        self.model, self.optimizer, self.vla_train_dataloader, self.lr_scheduler = self.setup_distributed_training(
             self.accelerator,
             self.model,
             self.optimizer,
             self.vla_train_dataloader,
+            self.lr_scheduler,
         )
+
+        if getattr(self, "resume_state_checkpoint", None):
+            self._load_checkpoint(self.resume_state_checkpoint)
+        else:
+            self._adjust_lr_scheduler_for_resume()
 
         self._init_wandb()
 
@@ -154,12 +172,18 @@ class VLATrainer(TrainerUtils):
     def _init_wandb(self):
         """Initialize Weights & Biases."""
         if self.accelerator.is_main_process:
+            init_timeout = int(os.environ.get("WANDB_INIT_TIMEOUT", "300"))
+            wandb_run_id = os.environ.get("WANDB_RUN_ID") or None
+            wandb_resume = os.environ.get("WANDB_RESUME") or None
             wandb.init(
                 name=self.config.run_id,
                 dir=os.path.join(self.config.output_dir, "wandb"),
                 project=self.config.wandb_project,
                 entity=self.config.wandb_entity,
                 group="vla-train",
+                id=wandb_run_id,
+                resume=wandb_resume,
+                settings=wandb.Settings(init_timeout=init_timeout),
             )
 
     def _save_initial_configs(self):
@@ -191,15 +215,24 @@ class VLATrainer(TrainerUtils):
         pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
         is_resume = getattr(self.config.trainer, "is_resume", False)
         self.resume_from_checkpoint = pretrained_checkpoint
+        self.resume_state_checkpoint = None
 
         if is_resume:
             resume_from_checkpoint, self.completed_steps = self._get_latest_checkpoint(self.checkpoint_dir)
             if resume_from_checkpoint:
                 self.resume_from_checkpoint = resume_from_checkpoint
-                self.model = self.load_pretrained_backbones(self.model, self.resume_from_checkpoint, reload_modules=None)
-                logger.info(
-                    f"Resuming training from checkpoint: {self.resume_from_checkpoint}, steps: {self.completed_steps}"
-                )
+                if os.path.isdir(self.resume_from_checkpoint):
+                    self.resume_state_checkpoint = self.resume_from_checkpoint
+                    logger.info(
+                        f"Resuming full training state from checkpoint: {self.resume_state_checkpoint}, "
+                        f"steps: {self.completed_steps}"
+                    )
+                else:
+                    self.model = self.load_pretrained_backbones(self.model, self.resume_from_checkpoint, reload_modules=None)
+                    logger.warning(
+                        "Resuming from a legacy model-only checkpoint without optimizer/scheduler state: "
+                        f"{self.resume_from_checkpoint}, steps: {self.completed_steps}"
+                    )
                 return
 
             logger.warning(f"No valid checkpoint found in {self.checkpoint_dir}. Starting training from scratch.")
@@ -217,21 +250,65 @@ class VLATrainer(TrainerUtils):
 
     def _adjust_lr_scheduler_for_resume(self):
         """Adjust LR scheduler state after resuming from non-zero steps."""
-        if self.completed_steps > 0:
+        if self.completed_steps > 0 and not getattr(self, "resume_state_checkpoint", None):
             logger.info(f"Adjusting LR scheduler for resume from step {self.completed_steps}")
-            for _ in range(self.completed_steps):
-                self.lr_scheduler.step()
+            self._fast_forward_lr_scheduler(self.completed_steps)
             logger.info(
                 f"LR scheduler adjusted to step {self.completed_steps}, current LR: {self.lr_scheduler.get_last_lr()}"
             )
 
+    def _get_manual_lr_scheduler(self):
+        """
+        Return the underlying raw scheduler for StarVLA's historical step semantics.
+
+        Accelerate wraps schedulers with `AcceleratedScheduler`, which can step the
+        underlying scheduler multiple times per optimizer update when
+        `split_batches=False`. Existing StarVLA runs were produced by stepping the
+        raw scheduler once per optimizer step, so resume compatibility needs to
+        preserve that behavior.
+        """
+        return getattr(self.lr_scheduler, "scheduler", self.lr_scheduler)
+
+    def _fast_forward_lr_scheduler(self, steps: int):
+        scheduler = self._get_manual_lr_scheduler()
+        for _ in range(steps):
+            scheduler.step()
+
+    def _step_lr_scheduler(self):
+        self._get_manual_lr_scheduler().step()
+
+    def _ensure_legacy_scheduler_state(self, checkpoint_path: str):
+        """
+        Backfill `scheduler.bin` for old full-state checkpoints that were saved
+        before StarVLA started serializing scheduler state.
+        """
+        scheduler_file = Path(checkpoint_path) / "scheduler.bin"
+        if scheduler_file.exists():
+            return
+
+        if self.accelerator.is_main_process:
+            logger.warning(
+                "Legacy checkpoint is missing scheduler.bin; reconstructing scheduler state "
+                f"from completed_steps={self.completed_steps} at {scheduler_file}"
+            )
+            self._fast_forward_lr_scheduler(self.completed_steps)
+            torch.save(self._get_manual_lr_scheduler().state_dict(), scheduler_file)
+            logger.info(f"Reconstructed scheduler state saved to {scheduler_file}")
+
+        self.accelerator.wait_for_everyone()
+
     def _load_checkpoint(self, checkpoint_path):
         """Load checkpoint."""
+        self._ensure_legacy_scheduler_state(checkpoint_path)
         self.accelerator.load_state(checkpoint_path)
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
     def _save_checkpoint(self):
         """Save current training state."""
+        state_checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}_state")
+        self.accelerator.save_state(state_checkpoint_path)
+        self.accelerator.wait_for_everyone()
+
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
@@ -249,7 +326,9 @@ class VLATrainer(TrainerUtils):
             summary_data = {"steps": self.completed_steps}
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
-            self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
+            self.accelerator.print(
+                f"✅ Checkpoint saved at {checkpoint_path} (full state: {state_checkpoint_path})"
+            )
 
             if isinstance(self.config, AccessTrackedConfig):
                 logger.info("📊 Saving accessed configuration...")
@@ -257,7 +336,53 @@ class VLATrainer(TrainerUtils):
                 self.config.save_accessed_config(output_dir / "config.yaml", use_original_values=False)
                 logger.info("✅ Configuration files saved")
 
+            self._prune_old_checkpoints()
+
         self.accelerator.wait_for_everyone()
+
+    def _get_checkpoint_retention_limit(self):
+        limit = getattr(self.config.trainer, "save_total_limit", None)
+        if limit in (None, "", False):
+            return None
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            logger.warning(f"Ignoring invalid trainer.save_total_limit={limit!r}")
+            return None
+        return limit if limit > 0 else None
+
+    def _prune_old_checkpoints(self):
+        limit = self._get_checkpoint_retention_limit()
+        if limit is None:
+            return
+
+        checkpoint_entries = {}
+        for entry in os.listdir(self.checkpoint_dir):
+            entry_path = os.path.join(self.checkpoint_dir, entry)
+
+            state_match = re.match(r"steps_(\d+)_state$", entry)
+            if state_match and os.path.isdir(entry_path):
+                checkpoint_entries.setdefault(int(state_match.group(1)), []).append(entry_path)
+                continue
+
+            weight_match = re.match(r"steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$", entry)
+            if weight_match and os.path.isfile(entry_path):
+                checkpoint_entries.setdefault(int(weight_match.group(1)), []).append(entry_path)
+
+        if len(checkpoint_entries) <= limit:
+            return
+
+        steps_to_prune = sorted(checkpoint_entries)[:-limit]
+        for step in steps_to_prune:
+            for entry_path in checkpoint_entries[step]:
+                try:
+                    if os.path.isdir(entry_path):
+                        shutil.rmtree(entry_path)
+                    else:
+                        os.remove(entry_path)
+                    logger.info(f"Pruned old checkpoint artifact: {entry_path}")
+                except FileNotFoundError:
+                    continue
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
@@ -269,7 +394,52 @@ class VLATrainer(TrainerUtils):
 
     def _create_data_iterators(self):
         """Create data iterators."""
-        self.vla_iter = iter(self.vla_train_dataloader)
+        if self.completed_steps > 0:
+            self.vla_iter = self._build_resume_aligned_iterator(self.vla_train_dataloader, "vla_epoch_count")
+        else:
+            self.vla_epoch_count = 0
+            self.vla_iter = iter(self.vla_train_dataloader)
+
+    def _build_resume_aligned_iterator(self, dataloader, epoch_attr: str):
+        """
+        Reconstruct the dataloader position from completed optimizer steps.
+
+        Accelerate/DeepSpeed restore model, optimizer, RNG, and scheduler state, but
+        StarVLA does not checkpoint the dataloader iterator position. Without
+        rebuilding the same epoch and intra-epoch batch offset, resumes from older
+        checkpoints replay a different data order immediately.
+        """
+        try:
+            steps_per_epoch = len(dataloader)
+        except TypeError:
+            self.accelerator.print(
+                "Dataloader does not expose a stable length; falling back to iterator start on resume."
+            )
+            setattr(self, epoch_attr, 0)
+            return iter(dataloader)
+
+        if steps_per_epoch <= 0:
+            setattr(self, epoch_attr, 0)
+            return iter(dataloader)
+
+        consumed_batches = self.completed_steps * self.accelerator.gradient_accumulation_steps
+        resume_epoch = consumed_batches // steps_per_epoch
+        resume_batch_offset = consumed_batches % steps_per_epoch
+
+        if hasattr(dataloader, "sampler") and callable(getattr(dataloader.sampler, "set_epoch", None)):
+            dataloader.sampler.set_epoch(resume_epoch)
+
+        setattr(self, epoch_attr, resume_epoch)
+        self.accelerator.print(
+            "Restoring dataloader position from completed steps: "
+            f"completed_steps={self.completed_steps}, "
+            f"grad_accum={self.accelerator.gradient_accumulation_steps}, "
+            f"resume_epoch={resume_epoch}, resume_batch_offset={resume_batch_offset}"
+        )
+
+        if resume_batch_offset > 0:
+            return iter(skip_first_batches(dataloader, num_batches=resume_batch_offset))
+        return iter(dataloader)
 
     def _get_next_batch(self):
         """Get next batch (automatically handle data loop)."""
@@ -290,9 +460,7 @@ class VLATrainer(TrainerUtils):
         self._log_training_config()
         self._create_data_iterators()
         progress_bar = tqdm(
-            total=self.config.trainer.max_train_steps,
-            initial=self.completed_steps,
-            disable=not self.accelerator.is_local_main_process,
+            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
         )
 
         while self.completed_steps < self.config.trainer.max_train_steps:
@@ -316,15 +484,16 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+            if self.accelerator.sync_gradients:
+                if self.completed_steps % self.config.trainer.eval_interval == 0:
+                    step_metrics = self.eval_action_model(step_metrics)
 
-            step_metrics["data_time"] = t_end_data - t_start_data
-            step_metrics["model_time"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+                step_metrics["data_time"] = t_end_data - t_start_data
+                step_metrics["model_time"] = t_end_model - t_start_model
+                self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
-                self._save_checkpoint()
+                if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+                    self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
                 break
@@ -365,21 +534,45 @@ class VLATrainer(TrainerUtils):
             self.optimizer.zero_grad()
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
+                output_dict = self.model.forward(
+                    batch_vla,
+                    current_step=self.completed_steps,
+                    forward_mode="action",
+                )
                 action_loss = output_dict["action_loss"]
-                total_loss = action_loss
 
-            self.accelerator.backward(total_loss)
+            self.accelerator.backward(action_loss)
+
+            total_loss_metric = output_dict.get("total_loss", action_loss).detach()
+            base_model = self.accelerator.unwrap_model(self.model)
+            run_mgv_this_step = base_model.mgv_enabled and base_model.mgv_module.should_run_mgv(self.completed_steps)
+            if run_mgv_this_step:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    mgv_output = self.model.forward(
+                        batch_vla,
+                        current_step=self.completed_steps,
+                        forward_mode="mgv",
+                    )
+                    mgv_loss_local = mgv_output.pop("_loss_mgv_local")
+                self.accelerator.backward(base_model.mgv_module.lambda_mgv * mgv_loss_local)
+                total_loss_metric = total_loss_metric + base_model.mgv_module.lambda_mgv * mgv_output["loss_mgv"].detach()
+                output_dict.update(mgv_output)
+
+            output_dict["total_loss"] = total_loss_metric
 
             if self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
-            self.lr_scheduler.step()
+            if self.accelerator.sync_gradients:
+                self._step_lr_scheduler()
 
-        return {
-            "action_dit_loss": action_loss.item(),
-        }
+        metrics = {}
+        for key, value in output_dict.items():
+            if isinstance(value, torch.Tensor) and value.ndim == 0:
+                metrics[key] = value.item()
+        metrics.setdefault("action_dit_loss", action_loss.item())
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""
@@ -410,6 +603,7 @@ def main(cfg) -> None:
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
 
+    accelerator = build_accelerator(cfg)
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)

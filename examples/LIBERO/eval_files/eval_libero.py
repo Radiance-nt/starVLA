@@ -5,9 +5,11 @@ import math
 import os
 import pathlib
 import time
+from typing import Any
 
 import imageio
 import numpy as np
+import torch
 import tqdm
 import tyro
 from libero.libero import benchmark, get_libero_path
@@ -18,6 +20,22 @@ from examples.LIBERO.eval_files.model2libero_interface import ModelClient
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+
+
+def _patch_torch_load_weights_only_false() -> None:
+    original_torch_load = torch.load
+
+    def _compat_torch_load(*args: Any, **kwargs: Any):
+        kwargs.setdefault("weights_only", False)
+        return original_torch_load(*args, **kwargs)
+
+    if getattr(torch.load, "_starvla_weights_only_patched", False):
+        return
+    _compat_torch_load._starvla_weights_only_patched = True
+    torch.load = _compat_torch_load
+
+
+_patch_torch_load_weights_only_false()
 
 
 def _binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:
@@ -41,11 +59,14 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    num_shards: int = 1
+    shard_index: int = 0
 
     #################################################################################################################
     # Utils
     #################################################################################################################
     video_out_path: str = "experiments/libero/logs"  # Path to save videos
+    result_json: str = ""
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -67,6 +88,10 @@ def eval_libero(args: Args) -> None:
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
+    if args.num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {args.num_shards}")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError(f"shard_index must be in [0, {args.num_shards}), got {args.shard_index}")
 
     # args.video_out_path = f"{date_base}+{args.job_name}"
 
@@ -92,9 +117,15 @@ def eval_libero(args: Args) -> None:
         image_size=args.resize_size,
     )
 
+    all_task_ids = list(range(num_tasks_in_suite))
+    logging.info(f"[info] using task orders {all_task_ids}")
+    task_ids = all_task_ids[args.shard_index :: args.num_shards]
+    logging.info(f"Evaluating shard {args.shard_index} / {args.num_shards} over task ids {task_ids}")
+
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    task_results: list[dict[str, Any]] = []
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -227,9 +258,33 @@ def eval_libero(args: Args) -> None:
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        task_results.append(
+            {
+                "task_id": task_id,
+                "task_description": task_description,
+                "episodes": task_episodes,
+                "successes": task_successes,
+                "success_rate": float(task_successes) / float(task_episodes),
+            }
+        )
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+    if args.result_json:
+        result_payload = {
+            "task_suite_name": args.task_suite_name,
+            "num_shards": args.num_shards,
+            "shard_index": args.shard_index,
+            "task_ids": task_ids,
+            "num_trials_per_task": args.num_trials_per_task,
+            "tasks": task_results,
+            "total_episodes": total_episodes,
+            "total_successes": total_successes,
+            "total_success_rate": float(total_successes) / float(total_episodes) if total_episodes else 0.0,
+        }
+        result_path = pathlib.Path(args.result_json)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps(result_payload, indent=2), encoding="utf-8")
 
 
 def _get_libero_env(task, resolution, seed):

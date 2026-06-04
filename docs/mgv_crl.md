@@ -164,10 +164,28 @@ BCEWithLogits(logit, target)
 - `logit_lang`
 - `logit_term`
 
-然后做 logit-level distillation。默认保留的主方向是：
+然后做 teacher-probability distillation。默认保留的主方向是：
 
 ```text
-MSE(logit_lang, stop_gradient(logit_term))
+BCEWithLogits(
+    logit_lang,
+    sigmoid(stop_gradient(logit_term))
+)
+```
+
+也就是说：
+
+- student 仍然输出 `logit_lang`
+- teacher 侧不再直接在 logit 空间做 MSE
+- 而是先把 `logit_term` 经过 `sigmoid` 变成 `[0, 1]` 的 soft reachability target，再喂给 `BCEWithLogits`
+
+如果打开反向 distill，则对应地使用：
+
+```text
+BCEWithLogits(
+    logit_term,
+    sigmoid(stop_gradient(logit_lang))
+)
 ```
 
 是否启用由：

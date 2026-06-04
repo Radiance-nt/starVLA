@@ -846,11 +846,19 @@ class MGVProgressModule(nn.Module):
 
             distill_weight = 0.0
             if self.enable_distill_term_to_lang:
-                loss_distill_term_to_lang = F.mse_loss(local_lang_reach_logit, local_term_reach_logit.detach())
+                teacher_term_prob = torch.sigmoid(local_term_reach_logit.detach())
+                loss_distill_term_to_lang = F.binary_cross_entropy_with_logits(
+                    local_lang_reach_logit,
+                    teacher_term_prob,
+                )
                 loss_distill = loss_distill + loss_distill_term_to_lang
                 distill_weight += 1.0
             if self.enable_distill_lang_to_term:
-                loss_distill_lang_to_term = F.mse_loss(local_term_reach_logit, local_lang_reach_logit.detach())
+                teacher_lang_prob = torch.sigmoid(local_lang_reach_logit.detach())
+                loss_distill_lang_to_term = F.binary_cross_entropy_with_logits(
+                    local_term_reach_logit,
+                    teacher_lang_prob,
+                )
                 loss_distill = loss_distill + loss_distill_lang_to_term
                 distill_weight += 1.0
             if distill_weight > 1.0:

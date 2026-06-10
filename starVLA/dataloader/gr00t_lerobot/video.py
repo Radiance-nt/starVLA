@@ -37,12 +37,17 @@ except (ImportError, RuntimeError):
     TORCHCODEC_AVAILABLE = False
 
 
+def _normalize_video_backend_kwargs(video_backend_kwargs: dict | None) -> dict:
+    return dict(video_backend_kwargs) if video_backend_kwargs is not None else {}
+
+
 def get_frames_by_indices(
     video_path: str,
     indices: list[int] | np.ndarray,
     video_backend: str = "decord",
     video_backend_kwargs: dict = {},
 ) -> np.ndarray:
+    video_backend_kwargs = _normalize_video_backend_kwargs(video_backend_kwargs)
     if video_backend == "decord":
         if not DECORD_AVAILABLE:
             raise ImportError("decord is not available.")
@@ -74,6 +79,7 @@ def get_frames_by_indices(
         try:
             container = av.open(video_path)
             stream = container.streams.video[0]
+            stream.codec_context.thread_count = int(video_backend_kwargs.get("num_threads", 1))
             time_base = float(stream.time_base)
             fps = float(stream.average_rate) if stream.average_rate else float(stream.guessed_rate)
             
@@ -137,6 +143,7 @@ def get_frames_by_timestamps(
     Returns:
         np.ndarray: Frames at the specified timestamps.
     """
+    video_backend_kwargs = _normalize_video_backend_kwargs(video_backend_kwargs)
     if video_backend == "decord":
         # For some GPUs, AV format data cannot be read
         if not DECORD_AVAILABLE:
@@ -186,6 +193,7 @@ def get_frames_by_timestamps(
         try:
             container = av.open(video_path)
             stream = container.streams.video[0]
+            stream.codec_context.thread_count = int(video_backend_kwargs.get("num_threads", 1))
             
             # Get video properties
             time_base = float(stream.time_base)
@@ -242,10 +250,11 @@ def get_frames_by_timestamps(
         torchvision.set_video_backend("pyav")
         loaded_frames = []
         loaded_ts = []
+        num_threads = int(video_backend_kwargs.get("num_threads", 1))
         
         reader = None
         try:
-            reader = torchvision.io.VideoReader(video_path, "video")
+            reader = torchvision.io.VideoReader(video_path, "video", num_threads=num_threads)
             
             for target_ts in timestamps:
                 # Reset reader state
@@ -309,6 +318,7 @@ def get_all_frames(
         video_backend_kwargs (dict, optional): Keyword arguments for the video backend.
         resize_size (tuple[int, int], optional): Resize size for the frames. Defaults to None.
     """
+    video_backend_kwargs = _normalize_video_backend_kwargs(video_backend_kwargs)
     if video_backend == "decord":
         if not DECORD_AVAILABLE:
             raise ImportError("decord is not available.")
@@ -324,6 +334,7 @@ def get_all_frames(
         return frames.data.numpy(), frames.pts_seconds.numpy()
     elif video_backend == "pyav":
         container = av.open(video_path)
+        container.streams.video[0].codec_context.thread_count = int(video_backend_kwargs.get("num_threads", 1))
         frames = []
         for frame in container.decode(video=0):
             frame = frame.to_ndarray(format="rgb24")
@@ -332,7 +343,8 @@ def get_all_frames(
     elif video_backend == "torchvision_av":
         # set backend and reader
         torchvision.set_video_backend("pyav")
-        reader = torchvision.io.VideoReader(video_path, "video")
+        num_threads = int(video_backend_kwargs.get("num_threads", 1))
+        reader = torchvision.io.VideoReader(video_path, "video", num_threads=num_threads)
         frames = []
         for frame in reader:
             frames.append(frame["data"].numpy())

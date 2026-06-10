@@ -19,6 +19,17 @@ from starVLA.dataloader.gr00t_lerobot.registry import (
 def collate_fn(batch):
     return batch
 
+
+def _resolve_video_backend_kwargs(data_cfg):
+    if data_cfg is None:
+        return {}
+
+    video_backend = data_cfg.get("video_backend", "decord")
+    video_backend_kwargs = dict(data_cfg.get("video_backend_kwargs", {}))
+    if video_backend == "torchvision_av":
+        video_backend_kwargs.setdefault("num_threads", int(data_cfg.get("video_backend_num_threads", 1)))
+    return video_backend_kwargs
+
 def make_LeRobotSingleDataset(
     data_root_dir: Path | str,
     data_name: str,
@@ -47,12 +58,14 @@ def make_LeRobotSingleDataset(
         embodiment_tag = ROBOT_TYPE_TO_EMBODIMENT_TAG[robot_type]
     
     video_backend = data_cfg.get("video_backend", "decord") if data_cfg else "torchvision_av"
+    video_backend_kwargs = _resolve_video_backend_kwargs(data_cfg)
     return LeRobotSingleDataset(
         dataset_path=dataset_path,
         modality_configs=modality_config,
         transforms=transforms,
         embodiment_tag=embodiment_tag,
         video_backend=video_backend, # decord is more efficiency | torchvision_av for video.av1
+        video_backend_kwargs=video_backend_kwargs,
         delete_pause_frame=delete_pause_frame,
         data_cfg=data_cfg,
     )

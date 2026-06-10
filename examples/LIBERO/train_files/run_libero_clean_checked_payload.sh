@@ -81,6 +81,10 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
 export TORCH_DIST_TIMEOUT_MINUTES="${TORCH_DIST_TIMEOUT_MINUTES:-1440}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 
 FRAMEWORK_NAME="${FRAMEWORK_NAME:-QwenOFT}"
 BASE_VLM="${BASE_VLM:-/mnt/petrelfs/linzhanhui/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17}"
@@ -97,6 +101,10 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-}"
 LOGGING_FREQUENCY="${LOGGING_FREQUENCY:-}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-1}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-false}"
+LOAD_ALL_DATA_FOR_TRAINING="${LOAD_ALL_DATA_FOR_TRAINING:-}"
 TRAINER_IS_RESUME="${TRAINER_IS_RESUME:-false}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
 RELOAD_MODULES="${RELOAD_MODULES:-}"
@@ -151,6 +159,15 @@ fi
 if [[ -n "${EVAL_INTERVAL}" ]]; then
   EXTRA_TRAIN_ARGS_STR+=" --trainer.eval_interval $(printf '%q' "${EVAL_INTERVAL}")"
 fi
+if [[ -n "${LOAD_ALL_DATA_FOR_TRAINING}" ]]; then
+  EXTRA_TRAIN_ARGS_STR+=" --datasets.vla_data.load_all_data_for_training $(printf '%q' "${LOAD_ALL_DATA_FOR_TRAINING}")"
+fi
+
+DATALOADER_ARGS_STR="--datasets.vla_data.num_workers $(printf '%q' "${NUM_WORKERS}")"
+if [[ "${NUM_WORKERS}" != "0" ]]; then
+  DATALOADER_ARGS_STR+=" --datasets.vla_data.prefetch_factor $(printf '%q' "${PREFETCH_FACTOR}")"
+  DATALOADER_ARGS_STR+=" --datasets.vla_data.persistent_workers $(printf '%q' "${PERSISTENT_WORKERS}")"
+fi
 
 git rev-parse HEAD > "${OUTPUT_DIR}/git_rev.txt"
 git status --short > "${OUTPUT_DIR}/git_status.txt"
@@ -174,6 +191,10 @@ echo "[INFO] PRETRAINED_CHECKPOINT=${PRETRAINED_CHECKPOINT}"
 echo "[INFO] NUM_WARMUP_STEPS=${NUM_WARMUP_STEPS:-<yaml>}"
 echo "[INFO] ACTION_GOAL_LANG_PROB=${ACTION_GOAL_LANG_PROB:-<yaml>}"
 echo "[INFO] SAVE_TOTAL_LIMIT=${SAVE_TOTAL_LIMIT}"
+echo "[INFO] NUM_WORKERS=${NUM_WORKERS}"
+echo "[INFO] PREFETCH_FACTOR=${PREFETCH_FACTOR}"
+echo "[INFO] PERSISTENT_WORKERS=${PERSISTENT_WORKERS}"
+echo "[INFO] LOAD_ALL_DATA_FOR_TRAINING=${LOAD_ALL_DATA_FOR_TRAINING:-<yaml>}"
 
 if ! srun --jobid "${SLURM_JOB_ID}" --ntasks "${SLURM_NNODES}" --ntasks-per-node=1 bash --noprofile --norc -c '
 set -euo pipefail
@@ -309,6 +330,10 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING}"
 export NCCL_TIMEOUT="${NCCL_TIMEOUT}"
 export TORCH_DIST_TIMEOUT_MINUTES="${TORCH_DIST_TIMEOUT_MINUTES}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS}"
 
 echo "[INFO] Host=\$(hostname) SLURM_PROCID=\${SLURM_PROCID}"
 echo "[INFO] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
@@ -330,9 +355,7 @@ accelerate launch \
   --datasets.vla_data.video_backend torchvision_av \
   --datasets.vla_data.action_type delta_qpos \
   --datasets.vla_data.per_device_batch_size "${PER_DEVICE_BS}" \
-  --datasets.vla_data.num_workers 1 \
-  --datasets.vla_data.prefetch_factor 1 \
-  --datasets.vla_data.persistent_workers false \
+  ${DATALOADER_ARGS_STR} \
   --trainer.gradient_accumulation_steps "${GRAD_ACCUM}" \
   --trainer.is_resume "${TRAINER_IS_RESUME}" \
   --run_root_dir "${RUN_ROOT_DIR}" \

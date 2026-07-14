@@ -1,12 +1,30 @@
+from pathlib import Path
+
+
+def _local_model_type(model_path: str) -> str | None:
+    path = Path(str(model_path))
+    if not path.exists():
+        return None
+
+    try:
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(str(path), trust_remote_code=True, local_files_only=True)
+    except Exception:
+        return None
+    return str(getattr(hf_config, "model_type", "")).lower() or None
+
+
 def get_vlm_model(config):
 
     vlm_name = config.framework.qwenvl.base_vlm
+    model_type = _local_model_type(vlm_name)
 
     if "Qwen2.5-VL" in vlm_name or "nora" in vlm_name.lower():  # temp for some ckpt
         from .QWen2_5 import _QWen_VL_Interface
 
         return _QWen_VL_Interface(config)
-    elif "Qwen3-VL" in vlm_name:
+    elif "Qwen3-VL" in vlm_name or model_type in {"qwen3_vl", "qwen3_vl_moe"}:
         from .QWen3 import _QWen3_VL_Interface
 
         return _QWen3_VL_Interface(config)

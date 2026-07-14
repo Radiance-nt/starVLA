@@ -32,6 +32,9 @@ def _cfg_get(cfg, key, default=None):
 def _cfg_set(cfg, key, value) -> None:
     if cfg is None:
         return
+    if hasattr(cfg, "unwrap"):
+        cfg[key] = value
+        return
     if OmegaConf.is_config(cfg):
         OmegaConf.update(cfg, key, value, force_add=True)
         return

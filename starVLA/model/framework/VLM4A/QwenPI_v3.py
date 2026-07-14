@@ -133,6 +133,7 @@ class QwenPI_v3DefaultConfig:
             },
         }
     )
+    encode_state_as_text: bool = True
 
 
 @FRAMEWORK_REGISTRY.register("QwenPI_v3")
@@ -234,6 +235,20 @@ class Qwen_PI_v3(baseframework):
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
 
+    def _prepare_instruction_and_state(
+        self,
+        examples: List[dict],
+        include_state: bool = True,
+    ) -> tuple[List[str], List[np.ndarray] | None]:
+        instructions = [example["lang"] for example in examples]
+        state = [example["state"] for example in examples] if include_state and "state" in examples[0] else None
+
+        if self.config.framework.get("encode_state_as_text", True) and state is not None:
+            instructions = self.add_discretized_state_to_instruction(instructions, state)
+            state = None
+
+        return instructions, state
+
     def _project_vl_hidden_for_action(self, vl_embs_list: List[torch.Tensor]) -> List[torch.Tensor]:
         """Project layer-wise VL hidden states to the hidden space expected by Action DiT."""
         if len(vl_embs_list) != len(self.project_layers):
@@ -278,17 +293,8 @@ class Qwen_PI_v3(baseframework):
                 action_loss (torch.Tensor): Scalar diffusion noise prediction loss.
         """
         batch_images = [example["image"] for example in examples]  # List[List[PIL.Image]], length B
-        instructions = [example["lang"] for example in examples]  # List[str], length B
         actions = [example["action"] for example in examples]  # List[ndarray (T, action_dim)]
-        state = (
-            [example["state"] for example in examples] if "state" in examples[0] else None
-        )  # List[ndarray (1, state_dim)] or None
-
-        # Prepend discretised proprioceptive state to each instruction string.
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
-        state = None  # state is now encoded in the instruction tokens
+        instructions, state = self._prepare_instruction_and_state(examples, include_state=True)
 
         # Step 1: encode through QwenVL
         vl_embs_list, backbone_attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
@@ -356,14 +362,7 @@ class Qwen_PI_v3(baseframework):
         """
 
         batch_images = [to_pil_preserve(example["image"]) for example in examples]  # List[List[PIL.Image]]
-        instructions = [example["lang"] for example in examples]  # List[str]
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # List[ndarray] or None
-
-        # Encode proprioceptive state into the instruction string, then discard raw state.
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
-        state = None
+        instructions, state = self._prepare_instruction_and_state(examples, include_state=True)
 
         # Optionally resize images to the resolution used during training.
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
@@ -408,7 +407,9 @@ class Qwen_PI_v3(baseframework):
         """
         updated_instructions = []
         for instr, state in zip(instructions, states):
-            state_str = self.state2str_transform(state[0])
+            state = np.asarray(state)
+            state_tokens = state[-1] if state.ndim > 1 else state
+            state_str = self.state2str_transform(state_tokens)
             updated_instructions.append(f"{instr} [STATE] {state_str} [ACTION]")
         return updated_instructions
 

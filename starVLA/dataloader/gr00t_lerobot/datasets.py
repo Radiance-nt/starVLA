@@ -73,6 +73,46 @@ LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
 LE_ROBOT3_EPISODE_FILENAME = "meta/episodes/*/*.parquet"
 
 
+def _to_numpy_array(value) -> np.ndarray:
+    """Convert torch / numpy values to a detached numpy array."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _pad_1d_list(values, target_len: int, pad_value):
+    values = list(values)
+    if len(values) > target_len:
+        raise ValueError(f"Cannot pad list of length {len(values)} down to smaller target {target_len}.")
+    return values + [pad_value] * (target_len - len(values))
+
+
+def _pad_action_stats_dict(action_stats: dict, target_dim: int) -> dict:
+    """Pad saved action statistics so they match the model output dimension."""
+    padded = copy.deepcopy(action_stats)
+    for stat_name in ["mean", "std", "max", "min", "q01", "q99"]:
+        if stat_name in padded:
+            padded[stat_name] = _pad_1d_list(padded[stat_name], target_dim, 0.0)
+    if "mask" in padded:
+        padded["mask"] = _pad_1d_list(padded["mask"], target_dim, False)
+    return padded
+
+
+def _detect_lerobot_version(dataset_path: Path) -> str:
+    if (dataset_path / LE_ROBOT3_TASKS_FILENAME).exists():
+        return "v3.0"
+    if (dataset_path / LE_ROBOT_TASKS_FILENAME).exists():
+        return "v2.0"
+    info_path = dataset_path / LE_ROBOT_INFO_FILENAME
+    if info_path.exists():
+        with open(info_path, "r") as f:
+            info = json.load(f)
+        codebase_version = str(info.get("codebase_version", "")).lower()
+        if codebase_version.startswith("v3"):
+            return "v3.0"
+    return "v2.0"
+
+
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
     """Calculate the dataset statistics of all columns for a list of parquet files."""
     # Dataset statistics
@@ -159,12 +199,132 @@ def _normalize_action_mode_state_map(action_mode_state_map: dict[str, str] | Non
     return normalized
 
 
+def _normalize_action_mode_wrap_keys(action_mode_wrap_keys: Sequence[str] | None) -> list[str]:
+    normalized = []
+    for key in action_mode_wrap_keys or []:
+        key = str(key)
+        if not key.startswith("action."):
+            key = f"action.{key}"
+        normalized.append(key)
+    return normalized
+
+
+def _normalize_action_mode_value_maps(action_mode_value_maps: dict | None) -> dict[str, dict]:
+    normalized = {}
+    for action_key, spec in (action_mode_value_maps or {}).items():
+        action_key = str(action_key)
+        if not action_key.startswith("action."):
+            action_key = f"action.{action_key}"
+        normalized[action_key] = dict(spec)
+    return normalized
+
+
+def _wrap_to_pi(values: np.ndarray) -> np.ndarray:
+    return (values + np.pi) % (2 * np.pi) - np.pi
+
+
+def _apply_action_value_map(values: np.ndarray, spec: dict) -> np.ndarray:
+    out = values.copy()
+    if "gt" in spec:
+        out = np.where(out > float(spec["gt"]), float(spec["value"]), out)
+    if "ge" in spec:
+        out = np.where(out >= float(spec["ge"]), float(spec["value"]), out)
+    if "lt" in spec:
+        out = np.where(out < float(spec["lt"]), float(spec["value"]), out)
+    if "le" in spec:
+        out = np.where(out <= float(spec["le"]), float(spec["value"]), out)
+    return out
+
+
+def _apply_action_postprocess(
+    data: dict,
+    action_mode_wrap_keys: Sequence[str] | None,
+    action_mode_value_maps: dict | None,
+) -> dict:
+    for key in _normalize_action_mode_wrap_keys(action_mode_wrap_keys):
+        if key in data:
+            data[key] = _wrap_to_pi(np.asarray(data[key]))
+
+    for key, spec in _normalize_action_mode_value_maps(action_mode_value_maps).items():
+        if key in data:
+            data[key] = _apply_action_value_map(np.asarray(data[key]), spec)
+
+    return data
+
+
 def _build_stats_cache_config(
     action_mode: str,
+    action_mode_apply_keys: Sequence[str] | None = None,
+    action_mode_state_map: dict | None = None,
+    action_mode_wrap_keys: Sequence[str] | None = None,
+    action_mode_value_maps: dict | None = None,
+    statistics_scope: str = "single_dataset",
+    statistics_dataset_paths: Sequence[str | Path] | None = None,
 ) -> dict:
-    return {
+    config = {
         "mode": action_mode,
+        "apply_keys": _normalize_action_mode_apply_keys(action_mode_apply_keys),
+        "state_map": _normalize_action_mode_state_map(action_mode_state_map),
+        "wrap_keys": _normalize_action_mode_wrap_keys(action_mode_wrap_keys),
+        "value_maps": _normalize_action_mode_value_maps(action_mode_value_maps),
     }
+
+    if statistics_scope != "single_dataset" or statistics_dataset_paths is not None:
+        config["statistics_scope"] = str(statistics_scope)
+        config["statistics_dataset_paths"] = [
+            str(Path(path)) for path in (statistics_dataset_paths or [])
+        ]
+
+    return config
+
+
+def _get_state_action_feature_signature(dataset_path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    info_path = dataset_path / LE_ROBOT_INFO_FILENAME
+    if not info_path.exists():
+        raise FileNotFoundError(f"Missing {LE_ROBOT_INFO_FILENAME}: {dataset_path}")
+
+    with open(info_path, "r") as f:
+        info = json.load(f)
+
+    features = info.get("features", {})
+    state_feature = features.get("state") or features.get("observation.state")
+    action_feature = features.get("actions") or features.get("action")
+    if state_feature is None or action_feature is None:
+        raise ValueError(
+            f"Cannot use {dataset_path} in joint statistics: missing state/actions feature metadata."
+        )
+
+    state_names = tuple(str(name) for name in (state_feature.get("names") or []))
+    action_names = tuple(str(name) for name in (action_feature.get("names") or []))
+    if not state_names or not action_names:
+        raise ValueError(
+            f"Cannot use {dataset_path} in joint statistics: state/action names are empty."
+        )
+
+    return state_names, action_names
+
+
+def _validate_joint_statistics_dataset_paths(dataset_paths: Sequence[Path]) -> None:
+    if not dataset_paths:
+        raise ValueError("joint_statistics is enabled but no dataset paths were provided.")
+
+    reference_path = dataset_paths[0]
+    reference_signature = _get_state_action_feature_signature(reference_path)
+    for dataset_path in dataset_paths[1:]:
+        signature = _get_state_action_feature_signature(dataset_path)
+        if signature != reference_signature:
+            raise ValueError(
+                "joint_statistics requires identical state/action schemas. "
+                f"Reference={reference_path}, mismatch={dataset_path}"
+            )
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.lower() not in {"false", "0", "no", "off"}
+    return bool(value)
 
 
 def _invalidate_legacy_stats_cache(stats_path: Path, reason: str) -> None:
@@ -236,6 +396,8 @@ def _compute_statistics_for_mode(
     state_indices: list[int] | None,
     action_mode_apply_keys: list[str] | None,
     action_mode_state_map: dict[str, str] | None,
+    action_mode_wrap_keys: list[str] | None,
+    action_mode_value_maps: dict | None,
 ) -> dict:
     if int(os.environ.get("RANK", "0")) == 0:
         print(f"[RANK 0] Calculating dataset statistics for {dataset_name} (mode={action_mode})")
@@ -274,6 +436,8 @@ def _compute_statistics_for_mode(
             action_mode_apply_keys=action_mode_apply_keys,
             action_mode_state_map=action_mode_state_map,
             base_stats=base_stats,
+            action_mode_wrap_keys=action_mode_wrap_keys,
+            action_mode_value_maps=action_mode_value_maps,
         )
     raise ValueError(f"Unsupported action mode for statistics: {action_mode}")
 
@@ -291,6 +455,8 @@ def _load_or_compute_statistics(
     state_indices: list[int] | None,
     action_mode_apply_keys: list[str] | None,
     action_mode_state_map: dict[str, str] | None,
+    action_mode_wrap_keys: list[str] | None,
+    action_mode_value_maps: dict | None,
 ) -> dict:
     le_statistics = _load_stats_cache(
         stats_path,
@@ -311,6 +477,8 @@ def _load_or_compute_statistics(
         state_indices=state_indices,
         action_mode_apply_keys=action_mode_apply_keys,
         action_mode_state_map=action_mode_state_map,
+        action_mode_wrap_keys=action_mode_wrap_keys,
+        action_mode_value_maps=action_mode_value_maps,
     )
     _save_stats_cache(stats_path, stats_cache_config, le_statistics)
     return le_statistics
@@ -470,6 +638,8 @@ def calculate_rel_action_statistics(
     action_mode_apply_keys: list[str] | None = None,
     action_mode_state_map: dict[str, str] | None = None,
     base_stats: dict | None = None,
+    action_mode_wrap_keys: list[str] | None = None,
+    action_mode_value_maps: dict | None = None,
 ) -> dict:
     """
     Calculate action statistics using rel mode.
@@ -489,6 +659,23 @@ def calculate_rel_action_statistics(
     )
     if not action_col_slices:
         raise ValueError("No action columns found in the dataset.")
+
+    def _postprocess_specs(keys: Sequence[str]) -> dict[str, list[tuple[tuple[int, int], str]]]:
+        specs: dict[str, list[tuple[tuple[int, int], str]]] = {}
+        for full_key in keys:
+            if not full_key.startswith("action."):
+                full_key = f"action.{full_key}"
+            subkey = full_key.replace("action.", "", 1)
+            if subkey not in lerobot_modality_meta.action:
+                raise ValueError(f"Action key {full_key} not found in metadata.")
+            cfg = lerobot_modality_meta.action[subkey]
+            action_col = cfg.original_key or subkey
+            specs.setdefault(action_col, []).append(((cfg.start, cfg.end), full_key))
+        return specs
+
+    wrap_specs = _postprocess_specs(_normalize_action_mode_wrap_keys(action_mode_wrap_keys))
+    value_map_specs = _postprocess_specs(_normalize_action_mode_value_maps(action_mode_value_maps).keys())
+    normalized_value_maps = _normalize_action_mode_value_maps(action_mode_value_maps)
 
     def _get_chunk(array: np.ndarray, step_indices: np.ndarray, padding_strategy: str) -> np.ndarray:
         max_length = array.shape[0]
@@ -536,6 +723,16 @@ def calculate_rel_action_statistics(
 
                     out = action_part_chunk - state_chunk[0]
                     action_chunk_full[:, a_slice[0] : a_slice[1]] = out
+
+                for a_slice, _ in wrap_specs.get(action_col, []):
+                    action_chunk_full[:, a_slice[0] : a_slice[1]] = _wrap_to_pi(
+                        action_chunk_full[:, a_slice[0] : a_slice[1]]
+                    )
+                for a_slice, full_key in value_map_specs.get(action_col, []):
+                    action_chunk_full[:, a_slice[0] : a_slice[1]] = _apply_action_value_map(
+                        action_chunk_full[:, a_slice[0] : a_slice[1]],
+                        normalized_value_maps[full_key],
+                    )
 
                 accum[action_col].append(action_chunk_full)
 
@@ -596,17 +793,24 @@ class LeRobotSingleDataset(Dataset):
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
         # indict letobot version
-        self._lerobot_version =  self.data_cfg.get("lerobot_version", "v2.0") #self._indict_lerobot_version(**kwargs)
+        configured_version = self.data_cfg.get("lerobot_version", None) if self.data_cfg else None
+        self._lerobot_version = configured_version or _detect_lerobot_version(Path(dataset_path))
 
         self._action_mode = None
         self._action_mode_state_map = {}
         self._action_mode_apply_keys = None
+        self._action_mode_wrap_keys = []
+        self._action_mode_value_maps = {}
 
         self.delete_pause_frame = delete_pause_frame
 
         self.modality_configs = modality_configs
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs if video_backend_kwargs is not None else {}
+        self._dataset_action_type = kwargs.get(
+            "dataset_action_type",
+            self.data_cfg.get("action_type", None) if self.data_cfg else None,
+        )
         self.transforms = (
             transforms if transforms is not None else ComposedModalityTransform(transforms=[])
         )
@@ -636,6 +840,8 @@ class LeRobotSingleDataset(Dataset):
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._all_steps = self._get_all_steps()
+        self._default_action_dim = self._infer_action_dim()
+        self._default_control_frequency_hz = self._infer_control_frequency_hz()
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
@@ -696,6 +902,57 @@ class LeRobotSingleDataset(Dataset):
         """
         return self._modality_keys
 
+    def _infer_action_dim(self) -> int:
+        total_dim = 0
+        for action_key in self.modality_keys.get("action", []):
+            subkey = action_key.replace("action.", "")
+            action_meta = self.metadata.modalities.action[subkey]
+            total_dim += int(np.prod(action_meta.shape))
+        return total_dim
+
+    def _infer_control_frequency_hz(self) -> float:
+        for video_key in self.modality_keys.get("video", []):
+            subkey = video_key.replace("video.", "")
+            video_meta = self.metadata.modalities.video.get(subkey, None)
+            if video_meta is not None and getattr(video_meta, "fps", None) is not None:
+                return float(video_meta.fps)
+        return float(self.lerobot_info_meta.get("fps", 30))
+
+    def _select_video_keys_for_sample(self) -> list[str]:
+        video_keys = list(self.modality_keys.get("video", []))
+        drop_prob = float(self.data_cfg.get("drop_one_non_wrist_camera_prob", 0.0)) if self.data_cfg else 0.0
+        if drop_prob <= 0.0:
+            return video_keys
+
+        # Only apply stochastic camera dropping to the 3-view ARX layout:
+        # keep wrist always, and randomly choose exactly one of {front, bird}.
+        arx_three_view_keys = {"video.front", "video.wrist", "video.bird"}
+        if set(video_keys) != arx_three_view_keys or random.random() >= drop_prob:
+            return video_keys
+
+        keep_non_wrist = random.choice(["video.front", "video.bird"])
+        kept_keys = {"video.wrist", keep_non_wrist}
+        return [key for key in video_keys if key in kept_keys]
+
+    def _maybe_pad_action(self, action: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
+        max_action_dim = int(self.data_cfg.get("max_action_dim", 0)) if self.data_cfg else 0
+        real_action_dim = int(action.shape[-1])
+        if max_action_dim <= 0:
+            return action, None
+        if real_action_dim > max_action_dim:
+            raise ValueError(
+                f"Dataset {self.dataset_name} action_dim={real_action_dim} exceeds max_action_dim={max_action_dim}"
+            )
+
+        action_mask = np.zeros((max_action_dim,), dtype=np.bool_)
+        action_mask[:real_action_dim] = True
+        if real_action_dim == max_action_dim:
+            return action, action_mask
+
+        padded_action = np.zeros((action.shape[0], max_action_dim), dtype=action.dtype)
+        padded_action[:, :real_action_dim] = action
+        return padded_action, action_mask
+
     @property
     def delta_indices(self) -> dict[str, np.ndarray]:
         """The delta indices for the dataset. The keys are the modality.key, and the values are the delta indices for each modality.key."""
@@ -736,6 +993,29 @@ class LeRobotSingleDataset(Dataset):
         """The tasks for the dataset."""
         return self._tasks
 
+    def _get_joint_statistics_settings(self) -> tuple[bool, Path | None, list[Path]]:
+        if self.data_cfg is None:
+            return False, None, []
+
+        joint_cfg = self.data_cfg.get("joint_statistics", None)
+        if not joint_cfg or not _as_bool(joint_cfg.get("enabled", False)):
+            return False, None, []
+
+        cache_path = joint_cfg.get("cache_path", None)
+        dataset_paths = self.data_cfg.get("_joint_statistics_dataset_paths", None)
+        if not dataset_paths:
+            dataset_paths = joint_cfg.get("dataset_paths", None)
+        if not dataset_paths:
+            dataset_paths = [self.dataset_path]
+
+        resolved_paths = [Path(path) for path in dataset_paths]
+        for dataset_path in resolved_paths:
+            if not dataset_path.exists():
+                raise FileNotFoundError(f"joint_statistics dataset path does not exist: {dataset_path}")
+
+        stats_path = Path(cache_path) if cache_path else self.dataset_path / "meta" / "joint_stats_gr00t.json"
+        return True, stats_path, resolved_paths
+
     def _get_metadata(self, embodiment_tag: EmbodimentTag) -> DatasetMetadata:
         """Get the metadata for the dataset.
 
@@ -745,13 +1025,9 @@ class LeRobotSingleDataset(Dataset):
 
         # 1. Modality metadata
         modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
         # 1.1. State and action modalities
         simplified_modality_meta: dict[str, dict] = {}
-        with open(modality_meta_path, "r") as f:
-            le_modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
+        le_modality_meta = self._get_lerobot_modality_meta()
         for modality in ["state", "action"]:
             simplified_modality_meta[modality] = {}
             le_state_action_meta: dict[str, LeRobotStateActionMetadata] = getattr(
@@ -812,7 +1088,6 @@ class LeRobotSingleDataset(Dataset):
         
         action_mode = _normalize_action_mode(self.data_cfg.get("action_mode", "abs") if self.data_cfg else "abs")
 
-        stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
         action_cfg = self.modality_configs.get("action")
         state_cfg = self.modality_configs.get("state")
         action_keys_full = list(action_cfg.modality_keys) if action_cfg else []
@@ -827,20 +1102,45 @@ class LeRobotSingleDataset(Dataset):
         normalized_state_map = _normalize_action_mode_state_map(
             self.data_cfg.get("action_mode_state_map", {}) if self.data_cfg else {}
         )
+        action_mode_wrap_keys = _normalize_action_mode_wrap_keys(
+            self.data_cfg.get("action_mode_wrap_keys", None) if self.data_cfg else None
+        )
+        action_mode_value_maps = _normalize_action_mode_value_maps(
+            self.data_cfg.get("action_mode_value_maps", {}) if self.data_cfg else {}
+        )
+        joint_statistics_enabled, joint_stats_path, joint_dataset_paths = self._get_joint_statistics_settings()
+        statistics_scope = "joint_dataset" if joint_statistics_enabled else "single_dataset"
         stats_cache_config = _build_stats_cache_config(
             action_mode=action_mode,
+            action_mode_apply_keys=apply_keys,
+            action_mode_state_map=normalized_state_map,
+            action_mode_wrap_keys=action_mode_wrap_keys,
+            action_mode_value_maps=action_mode_value_maps,
+            statistics_scope=statistics_scope,
+            statistics_dataset_paths=joint_dataset_paths if joint_statistics_enabled else None,
         )
-        parquet_files = list(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
+        stats_path = joint_stats_path if joint_statistics_enabled else self.dataset_path / LE_ROBOT_STATS_FILENAME
+        if joint_statistics_enabled:
+            _validate_joint_statistics_dataset_paths(joint_dataset_paths)
+            parquet_files = []
+            for dataset_path in joint_dataset_paths:
+                parquet_files.extend(sorted(dataset_path.glob(LE_ROBOT_DATA_FILENAME)))
+            stats_dataset_name = "joint:" + ",".join(path.name for path in joint_dataset_paths)
+        else:
+            parquet_files = list(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
+            stats_dataset_name = self.dataset_name
         parquet_files_filtered = [
             pf for pf in parquet_files if "episode_033675.parquet" not in pf.name
         ]
+        if not parquet_files_filtered:
+            raise ValueError(f"No parquet files found for statistics under {self.dataset_path}")
 
         if is_main():
             le_statistics = _load_or_compute_statistics(
                 stats_path,
                 stats_cache_config=stats_cache_config,
                 parquet_paths=parquet_files_filtered,
-                dataset_name=self.dataset_name,
+                dataset_name=stats_dataset_name,
                 action_mode=action_mode,
                 lerobot_modality_meta=le_modality_meta,
                 action_keys_full=action_keys_full,
@@ -849,6 +1149,8 @@ class LeRobotSingleDataset(Dataset):
                 state_indices=state_indices,
                 action_mode_apply_keys=apply_keys,
                 action_mode_state_map=normalized_state_map,
+                action_mode_wrap_keys=action_mode_wrap_keys,
+                action_mode_value_maps=action_mode_value_maps,
             )
         else:
             le_statistics = None
@@ -952,7 +1254,6 @@ class LeRobotSingleDataset(Dataset):
                                 "chunk_index": int(episode[chunk_col]),
                                 "file_index": int(episode[file_col]),
                             }
-                    print(video_file_indices)
                     episode_meta = {
                         "data/chunk_index": episode["data/chunk_index"],
                         "data/file_index": episode["data/file_index"],
@@ -1223,6 +1524,12 @@ class LeRobotSingleDataset(Dataset):
         self._action_mode_state_map = _normalize_action_mode_state_map(
             self.data_cfg.get("action_mode_state_map", {}) or {}
         )
+        self._action_mode_wrap_keys = _normalize_action_mode_wrap_keys(
+            self.data_cfg.get("action_mode_wrap_keys", None)
+        )
+        self._action_mode_value_maps = _normalize_action_mode_value_maps(
+            self.data_cfg.get("action_mode_value_maps", {}) or {}
+        )
 
     def _infer_state_key_for_action(self, action_key: str) -> str | None:
         if action_key in self._action_mode_state_map:
@@ -1237,7 +1544,7 @@ class LeRobotSingleDataset(Dataset):
 
     def _apply_action_mode(self, data: dict) -> dict:
         if self._action_mode in (None, "abs"):
-            return data
+            return _apply_action_postprocess(data, self._action_mode_wrap_keys, self._action_mode_value_maps)
 
         action_keys = self._action_mode_apply_keys or self.modality_keys.get("action", [])
         for action_key in action_keys:
@@ -1274,17 +1581,63 @@ class LeRobotSingleDataset(Dataset):
 
             data[action_key] = out
 
-        return data
+        return _apply_action_postprocess(data, self._action_mode_wrap_keys, self._action_mode_value_maps)
 
     def _get_lerobot_modality_meta(self) -> LeRobotModalityMetadata:
         """Get the metadata for the LeRobot dataset."""
         modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
+        if modality_meta_path.exists():
+            with open(modality_meta_path, "r") as f:
+                modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
+            return modality_meta
+
+        info_meta_path = self.dataset_path / LE_ROBOT_INFO_FILENAME
         assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
-        with open(modality_meta_path, "r") as f:
-            modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
-        return modality_meta
+            info_meta_path.exists()
+        ), f"Please provide either {LE_ROBOT_MODALITY_FILENAME} or {LE_ROBOT_INFO_FILENAME} in {self.dataset_path}"
+        with open(info_meta_path, "r") as f:
+            info_meta = json.load(f)
+
+        features = info_meta.get("features", {})
+        state_feature = features.get("state") or features.get("observation.state")
+        action_feature = features.get("actions") or features.get("action")
+        if state_feature is None or action_feature is None:
+            raise ValueError(
+                f"Cannot synthesize modality metadata for {self.dataset_path}: "
+                "missing state/actions feature entries in meta/info.json"
+            )
+
+        def _build_named_slices(feature: dict, original_key: str) -> dict:
+            names = feature.get("names")
+            if not names:
+                raise ValueError(
+                    f"Cannot synthesize modality metadata for {self.dataset_path}: "
+                    f"feature {original_key} has no names"
+                )
+            return {
+                str(name): {"start": index, "end": index + 1, "original_key": original_key}
+                for index, name in enumerate(names)
+            }
+
+        video = {}
+        for feature_key, feature in features.items():
+            if feature.get("dtype") != "video":
+                continue
+            if feature_key == "image":
+                video_key = "front"
+            elif feature_key == "wrist_image":
+                video_key = "wrist"
+            else:
+                video_key = str(feature_key).replace("observation.images.", "")
+            video[video_key] = {"original_key": feature_key}
+
+        synthesized = {
+            "state": _build_named_slices(state_feature, "state" if "state" in features else "observation.state"),
+            "action": _build_named_slices(action_feature, "actions" if "actions" in features else "action"),
+            "video": video,
+            "annotation": {"human.action.task_description": {"original_key": "task_index"}},
+        }
+        return LeRobotModalityMetadata.model_validate(synthesized)
 
     def _get_lerobot_info_meta(self) -> dict:
         """Get the metadata for the LeRobot dataset."""
@@ -1379,23 +1732,32 @@ class LeRobotSingleDataset(Dataset):
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
         step_images = []
-        for video_key in self.modality_keys["video"]:
+        selected_video_keys = self._select_video_keys_for_sample()
+        for video_key in selected_video_keys:
             image = data[video_key][0]
             image = Image.fromarray(image).resize((224, 224))
             step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
-        action = []
-        for action_key in self.modality_keys["action"]:
-            action.append(data[action_key])
+        action = [_to_numpy_array(data[action_key]) for action_key in self.modality_keys["action"]]
         action = np.concatenate(action, axis=1).astype(np.float16)
+        real_action_dim = int(action.shape[-1])
+        action, action_mask = self._maybe_pad_action(action)
 
         sample = {
             "action": action,
             "image": step_images,
             "lang": language,
-            "robot_tag": self.tag
+            "robot_tag": self.tag,
+            "dataset_name": self.dataset_name,
+            "real_action_dim": real_action_dim,
+            "action_frequency_hz": self._default_control_frequency_hz,
+            "action_type": self._dataset_action_type,
+            "selected_image_keys": [key.replace("video.", "") for key in selected_video_keys],
+            "all_image_keys": [key.replace("video.", "") for key in self.modality_keys.get("video", [])],
         }
+        if action_mask is not None:
+            sample["action_mask"] = action_mask
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
             state = []
@@ -1876,6 +2238,10 @@ class LeRobotSingleDataset(Dataset):
                     normalization_modes=_action_norm_modes,
                 )
                 combined_action_stats["mask"] = mask
+                combined_action_stats["real_action_dim"] = len(combined_action_stats["q01"])
+                max_action_dim = int(self.data_cfg.get("max_action_dim", 0)) if self.data_cfg else 0
+                if max_action_dim > 0:
+                    combined_action_stats = _pad_action_stats_dict(combined_action_stats, max_action_dim)
                 
                 tag_stats["action"] = combined_action_stats
         
@@ -2173,6 +2539,7 @@ class LeRobotMixtureDataset(Dataset):
         seed: int = 42,
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
+            "normalization_scope": "per_dataset",
         },
         **kwargs,
     ):
@@ -2625,46 +2992,97 @@ class LeRobotMixtureDataset(Dataset):
 
         return DatasetMetadata.model_validate(merged_metadata)
 
+    @staticmethod
+    def _get_metadata_strategy(metadata_config: dict) -> str:
+        strategy = metadata_config.get("normalization_scope", "per_dataset")
+        if strategy not in {"per_dataset", "per_tag"}:
+            raise ValueError(
+                f"Invalid normalization_scope `{strategy}`. Expected `per_dataset` or `per_tag`."
+            )
+        return strategy
+
+    def _get_metadata_entry_key(self, dataset: LeRobotSingleDataset) -> str:
+        if self._metadata_strategy == "per_dataset":
+            if len(self.datasets) == 1:
+                return dataset.tag
+            return f"{dataset.tag}:{dataset.dataset_name}"
+        return dataset.tag
+
     def update_metadata(self, metadata_config: dict, cached_statistics_path: Path | str | None = None) -> None:
         """
-        Merge multiple metadatas into one and set the transforms with the merged metadata.
+        Resolve mixture normalization metadata and set transforms for each dataset.
 
         Args:
             metadata_config (dict): Configuration for the metadata.
                 "percentile_mixing_method": The method to mix the percentiles, either "weighted_average" or "min_max".
                     weighted_average: Use the weighted average of the percentiles using the weight used in sampling the datasets.
                     min_max: Use the min of the 1st percentile and max of the 99th percentile.
+                "normalization_scope": Either "per_dataset" (default) or "per_tag".
         """
-        # If cached path is provided, try to load and apply
-        if cached_statistics_path is not None:
-            try:
-                cached_stats = self.load_merged_statistics(cached_statistics_path)
-                self.apply_cached_statistics(cached_stats)
-                return
-            except (FileNotFoundError, KeyError, ValidationError) as e:
-                print(f"Failed to load cached statistics: {e}")
-                print("Falling back to computing statistics from scratch...")
-
+        self._metadata_strategy = self._get_metadata_strategy(metadata_config)
         self.tag = EmbodimentTag.NEW_EMBODIMENT.value
         self.merged_metadata: dict[str, DatasetMetadata] = {}
+        self._metadata_entry_to_datasets: dict[str, list[LeRobotSingleDataset]] = {}
+
+        # If cached path is provided, try to load and apply
+        if cached_statistics_path is not None:
+            if self._metadata_strategy == "per_dataset":
+                print(
+                    "Ignoring cached mixture statistics because per-dataset normalization "
+                    "uses each dataset's own metadata."
+                )
+            else:
+                try:
+                    cached_stats = self.load_merged_statistics(cached_statistics_path)
+                    self.apply_cached_statistics(cached_stats)
+                    return
+                except (FileNotFoundError, KeyError, ValidationError) as e:
+                    print(f"Failed to load cached statistics: {e}")
+                    print("Falling back to computing statistics from scratch...")
+
+        if self._metadata_strategy == "per_dataset":
+            for dataset in self.datasets:
+                dataset_key = self._get_metadata_entry_key(dataset)
+                if dataset_key in self.merged_metadata:
+                    raise ValueError(f"Duplicate dataset metadata key detected: {dataset_key}")
+                self.merged_metadata[dataset_key] = dataset.metadata
+                self._metadata_entry_to_datasets[dataset_key] = [dataset]
+                dataset.set_transforms_metadata(dataset.metadata)
+            return
+
         # Group metadata by tag
         all_metadatas: dict[str, list[DatasetMetadata]] = {}
-        for dataset in self.datasets:
+        datasets_by_tag: dict[str, list[LeRobotSingleDataset]] = {}
+        weights_by_tag: dict[str, list[float]] = {}
+        for idx, dataset in enumerate(self.datasets):
             if dataset.tag not in all_metadatas:
                 all_metadatas[dataset.tag] = []
+                datasets_by_tag[dataset.tag] = []
+                weights_by_tag[dataset.tag] = []
             all_metadatas[dataset.tag].append(dataset.metadata)
+            datasets_by_tag[dataset.tag].append(dataset)
+            weights_by_tag[dataset.tag].append(float(self.dataset_sampling_weights[idx]))
         for tag, metadatas in all_metadatas.items():
-            self.merged_metadata[tag] = self.merge_metadata(
-                metadatas=metadatas,
-                dataset_sampling_weights=self.dataset_sampling_weights.tolist(),
-                percentile_mixing_method=metadata_config["percentile_mixing_method"],
-            )
+            try:
+                self.merged_metadata[tag] = self.merge_metadata(
+                    metadatas=metadatas,
+                    dataset_sampling_weights=weights_by_tag[tag],
+                    percentile_mixing_method=metadata_config["percentile_mixing_method"],
+                )
+                self._metadata_entry_to_datasets[tag] = datasets_by_tag[tag]
+            except Exception as e:
+                dataset_names = [dataset.dataset_name for dataset in datasets_by_tag[tag]]
+                raise RuntimeError(
+                    f"Failed to merge metadata for embodiment tag {tag} across datasets "
+                    f"{dataset_names}. Use normalization_scope=per_dataset for heterogeneous mixtures."
+                ) from e
         for dataset in self.datasets:
-            dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
+            if dataset.tag in self.merged_metadata:
+                dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
 
     def save_dataset_statistics(self, save_path: Path | str, format: str = "json") -> None:
         """
-        Save merged dataset statistics to specified path in the required format.
+        Save mixture dataset statistics to specified path in the required format.
         Only includes statistics for keys that are actually used in the datasets.
         Gripper-related keys will be placed at the end.
         
@@ -2729,6 +3147,10 @@ class LeRobotMixtureDataset(Dataset):
                         normalization_modes=_action_norm_modes,
                     )
                     combined_action_stats["mask"] = mask
+                    combined_action_stats["real_action_dim"] = len(combined_action_stats["q01"])
+                    max_action_dim = int(self.data_cfg.get("max_action_dim", 0)) if self.data_cfg else 0
+                    if max_action_dim > 0:
+                        combined_action_stats = _pad_action_stats_dict(combined_action_stats, max_action_dim)
                     
                     tag_stats["action"] = combined_action_stats
             
@@ -2769,7 +3191,7 @@ class LeRobotMixtureDataset(Dataset):
         else:
             raise ValueError(f"Unsupported format: {format}. Currently only 'json' is supported.")
         
-        print(f"Merged dataset statistics saved to: {save_path}")
+        print(f"Mixture dataset statistics saved to: {save_path}")
         print(f"Used action keys (reordered): {list(all_used_action_keys)}")
         print(f"Used state keys (reordered): {list(all_used_state_keys)}")
 
@@ -2784,10 +3206,10 @@ class LeRobotMixtureDataset(Dataset):
 
     def _get_dataset_counts(self, tag: str) -> dict:
         """
-        Get dataset count information for specified tag.
+        Get dataset count information for a saved metadata entry.
         
         Args:
-            tag (str): embodiment tag
+            tag (str): Metadata entry key
             
         Returns:
             dict: Dictionary containing num_transitions and num_trajectories
@@ -2795,11 +3217,9 @@ class LeRobotMixtureDataset(Dataset):
         num_transitions = 0
         num_trajectories = 0
         
-        # Count dataset information belonging to this tag
-        for dataset in self.datasets:
-            if dataset.tag == tag:
-                num_transitions += len(dataset)
-                num_trajectories += len(dataset.trajectory_ids)
+        for dataset in self._metadata_entry_to_datasets.get(tag, []):
+            num_transitions += len(dataset)
+            num_trajectories += len(dataset.trajectory_ids)
         
         return {
             "num_transitions": num_transitions,
@@ -2851,6 +3271,10 @@ class LeRobotMixtureDataset(Dataset):
         
         # Apply cached statistics
         self.merged_metadata = {}
+        self._metadata_entry_to_datasets = {}
+        for dataset in self.datasets:
+            dataset_key = self._get_metadata_entry_key(dataset)
+            self._metadata_entry_to_datasets.setdefault(dataset_key, []).append(dataset)
         for tag, stats_data in cached_statistics.items():
             if tag == "metadata":  # Skip metadata field
                 continue

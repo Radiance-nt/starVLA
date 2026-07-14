@@ -14,6 +14,7 @@ Conventions:
 import argparse
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Tuple
@@ -112,6 +113,81 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
     )
 
     return optimizer, lr_scheduler
+
+
+def _cfg_get(cfg_node, key, default=None):
+    if cfg_node is None:
+        return default
+    try:
+        return cfg_node.get(key, default)
+    except AttributeError:
+        return default
+
+
+def _cfg_list(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return list(value)
+
+
+def _get_submodule_parent(model, module_path: str):
+    parts = [part for part in module_path.split(".") if part]
+    if not parts:
+        raise ValueError("LoRA module_path cannot be empty")
+    parent = model
+    for attr in parts[:-1]:
+        parent = getattr(parent, attr)
+    return parent, parts[-1], getattr(parent, parts[-1])
+
+
+def apply_lora_if_configured(model, cfg):
+    """Inject PEFT LoRA adapters before optimizer and DeepSpeed wrapping."""
+    lora_cfg = _cfg_get(cfg.trainer, "lora", None)
+    if not lora_cfg or not _cfg_get(lora_cfg, "enabled", False):
+        return model
+
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+    except ImportError as exc:
+        raise ImportError(
+            "trainer.lora.enabled=true requires `peft` in the training environment."
+        ) from exc
+
+    module_path = _cfg_get(lora_cfg, "module_path", "qwen_vl_interface.model")
+    parent, attr_name, target_module = _get_submodule_parent(model, module_path)
+    target_modules = _cfg_list(
+        _cfg_get(lora_cfg, "target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
+    )
+    modules_to_save = _cfg_list(_cfg_get(lora_cfg, "modules_to_save", None))
+
+    peft_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=int(_cfg_get(lora_cfg, "r", 16)),
+        lora_alpha=int(_cfg_get(lora_cfg, "lora_alpha", 32)),
+        lora_dropout=float(_cfg_get(lora_cfg, "lora_dropout", 0.05)),
+        target_modules=target_modules,
+        bias=str(_cfg_get(lora_cfg, "bias", "none")),
+        modules_to_save=modules_to_save,
+    )
+    wrapped_module = get_peft_model(target_module, peft_cfg)
+    setattr(parent, attr_name, wrapped_module)
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.info(
+            "LoRA enabled on `%s`: r=%s alpha=%s dropout=%s target_modules=%s modules_to_save=%s",
+            module_path,
+            peft_cfg.r,
+            peft_cfg.lora_alpha,
+            peft_cfg.lora_dropout,
+            target_modules,
+            modules_to_save,
+        )
+        if hasattr(wrapped_module, "print_trainable_parameters"):
+            wrapped_module.print_trainable_parameters()
+
+    return model
 
 
 class VLATrainer(TrainerUtils):
@@ -260,6 +336,35 @@ class VLATrainer(TrainerUtils):
         self.accelerator.load_state(checkpoint_path)
         self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
 
+    def _prune_old_checkpoints(self):
+        """Keep only the newest step checkpoints when configured."""
+        max_to_keep = getattr(self.config.trainer, "max_checkpoints_to_keep", None)
+        if max_to_keep is None:
+            return
+
+        max_to_keep = int(max_to_keep)
+        if max_to_keep <= 0:
+            logger.warning("max_checkpoints_to_keep=%s disables checkpoint pruning.", max_to_keep)
+            return
+
+        checkpoint_re = re.compile(r"^steps_(\d+)_(?:pytorch_model\.pt|model\.safetensors)$")
+        checkpoints_by_step = {}
+        for filename in os.listdir(self.checkpoint_dir):
+            match = checkpoint_re.match(filename)
+            if not match:
+                continue
+            path = os.path.join(self.checkpoint_dir, filename)
+            if os.path.isfile(path):
+                checkpoints_by_step.setdefault(int(match.group(1)), []).append(path)
+
+        for step in sorted(checkpoints_by_step)[:-max_to_keep]:
+            for path in checkpoints_by_step[step]:
+                try:
+                    os.remove(path)
+                    logger.info("Removed old checkpoint: %s", path)
+                except OSError as exc:
+                    logger.warning("Failed to remove old checkpoint %s: %s", path, exc)
+
     def _save_checkpoint(self):
         """Save current training state."""
         if self.accelerator.is_main_process:
@@ -286,6 +391,8 @@ class VLATrainer(TrainerUtils):
                 output_dir = Path(self.config.output_dir)
                 self.config.save_accessed_config(output_dir / "config.yaml", use_original_values=False)
                 logger.info("✅ Configuration files saved")
+
+            self._prune_old_checkpoints()
 
         self.accelerator.wait_for_everyone()
 
@@ -362,7 +469,8 @@ class VLATrainer(TrainerUtils):
             step_metrics["timing/model"] = t_end_model - t_start_model
             self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            save_interval = int(getattr(self.config.trainer, "save_interval", 0) or 0)
+            if save_interval > 0 and self.completed_steps % save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -462,6 +570,7 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    vla = apply_lora_if_configured(vla, cfg)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(

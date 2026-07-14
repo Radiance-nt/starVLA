@@ -1,0 +1,136 @@
+run_id: arx_openpi_tube_human_v2_vlaccut_30b_qwenpi_v3_lora_z2_statetext_jointstats
+run_root_dir: /mnt/hwfile/linzhanhui/runs_inspect/starVLA_direct
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: null
+wandb_project: starVLA_vlac
+is_debug: false
+
+framework:
+  name: QwenPI_v3
+  qwenvl:
+    base_vlm: /mnt/hwfile/linzhanhui/projects/vpb_eval_clean/release/vlac_cut_model_release/VLAC-Cut
+    attn_implementation: sdpa
+    ignore_mismatched_sizes: false
+    enable_gradient_checkpointing: true
+    vl_hidden_dim: 2048
+    num_vl_layers: 48
+
+  action_model:
+    action_model_type: LayerwiseFM
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 7
+    state_dim: 7
+    future_action_window_size: 31
+    action_horizon: 32
+    past_action_window_size: 0
+    repeated_diffusion_steps: 2
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      action_dit_hidden_dim: 1024
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+      attention_head_dim: 64
+  obs_image_size: [224, 224]
+  encode_state_as_text: true
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /
+    data_mix: ARX_openpi_tube_human_v2
+    action_type: delta_ee
+    action_mode: rel
+    action_mode_apply_keys:
+      - action.delta_pos.x
+      - action.delta_pos.y
+      - action.delta_pos.z
+      - action.delta_pos.roll
+      - action.delta_pos.pitch
+      - action.delta_pos.yaw
+    action_mode_state_map:
+      action.delta_pos.x: state.end_effector_pos.x
+      action.delta_pos.y: state.end_effector_pos.y
+      action.delta_pos.z: state.end_effector_pos.z
+      action.delta_pos.roll: state.end_effector_pos.roll
+      action.delta_pos.pitch: state.end_effector_pos.pitch
+      action.delta_pos.yaw: state.end_effector_pos.yaw
+    action_mode_wrap_keys:
+      - action.delta_pos.roll
+      - action.delta_pos.pitch
+      - action.delta_pos.yaw
+    action_mode_value_maps:
+      action.delta_pos.gripper:
+        gt: 1.3
+        value: 3.45
+    default_image_resolution: [3, 224, 224]
+    per_device_batch_size: 1
+    num_workers: 1
+    prefetch_factor: 1
+    persistent_workers: false
+    include_state: true
+    image_size: [224, 224]
+    video_backend: pyav
+    joint_statistics:
+      enabled: true
+      cache_path: /mnt/inspurfs/vla_coop/data_2/haoran_data/arx_openpi_tube_human_v2_joint_stats/stats_gr00t.json
+    metadata_config:
+      normalization_scope: per_tag
+      percentile_mixing_method: min_max
+
+trainer:
+  epochs: 100
+  max_train_steps: 100000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  max_checkpoints_to_keep: 2
+  eval_interval: 200
+  learning_rate:
+    base: 5.0e-06
+    qwen_vl_interface: 2.0e-05
+    action_model: 1.0e-04
+    project_layers: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: ""
+  lora:
+    enabled: true
+    module_path: qwen_vl_interface.model
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    bias: none
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    modules_to_save: null
+  loss_scale:
+    vla: 1.0
+    vlm: 0.0
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  pretrained_checkpoint: null
+  reload_modules: null
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true

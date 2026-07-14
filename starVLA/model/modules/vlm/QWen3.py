@@ -7,8 +7,13 @@ from typing import Optional
 import torch
 from starVLA.model.tools import has_flash_attn  # unified flash-attn detection (GPU / NPU)
 from starVLA.training.trainer_utils import initialize_overwatch
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+from transformers import AutoConfig, AutoProcessor, Qwen3VLForConditionalGeneration
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+try:
+    from transformers import Qwen3VLMoeForConditionalGeneration
+except ImportError:  # pragma: no cover - older transformers without Qwen3-VL MoE.
+    Qwen3VLMoeForConditionalGeneration = None
 
 logger = initialize_overwatch(__name__)
 
@@ -25,6 +30,33 @@ _ACTION_TOKEN_MAX = (
 
 
 import torch.nn as nn
+
+
+def _patch_qwen3_vl_moe_router_dtype():
+    from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeTextSparseMoeBlock
+
+    if getattr(Qwen3VLMoeTextSparseMoeBlock, "_starvla_router_dtype_patched", False):
+        return
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        router_logits = self.gate(hidden_states)
+        routing_weights = torch.nn.functional.softmax(router_logits, dim=-1, dtype=torch.float)
+        routing_weights, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+        router_weights = torch.zeros(
+            router_logits.shape,
+            dtype=routing_weights.dtype,
+            device=router_logits.device,
+        ).scatter_(1, router_indices, routing_weights)
+        hidden_states = hidden_states.reshape(batch_size, -1, self.hidden_size)
+        routed_out = self.experts(hidden_states, router_weights, router_indices)
+        return routed_out, router_logits
+
+    Qwen3VLMoeTextSparseMoeBlock.forward = forward
+    Qwen3VLMoeTextSparseMoeBlock._starvla_router_dtype_patched = True
 
 
 class _QWen3_VL_Interface(nn.Module):
@@ -50,21 +82,42 @@ class _QWen3_VL_Interface(nn.Module):
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
-        attn_implementation = "sdpa"
+        ignore_mismatched_sizes = qwenvl_config.get("ignore_mismatched_sizes", False)
+        enable_grad_ckpt = bool(qwenvl_config.get("enable_gradient_checkpointing", False))
+
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":
             if not has_flash_attn():
                 print("[WARNING] flash_attn not installed, falling back to sdpa")
                 attn_implementation = "sdpa"
 
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
+        hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        model_cls = Qwen3VLForConditionalGeneration
+        if str(getattr(hf_config, "model_type", "")).lower() == "qwen3_vl_moe":
+            if Qwen3VLMoeForConditionalGeneration is None:
+                raise ImportError("qwen3_vl_moe checkpoint requested, but this transformers install has no Qwen3VLMoeForConditionalGeneration")
+            _patch_qwen3_vl_moe_router_dtype()
+            model_cls = Qwen3VLMoeForConditionalGeneration
+
+        model = model_cls.from_pretrained(
             model_id,
             attn_implementation=attn_implementation,
             dtype=torch.bfloat16,
-            ignore_mismatched_sizes=True, # resize image no longer needed? @TODO check bug
+            ignore_mismatched_sizes=ignore_mismatched_sizes,
         )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
+
+        if enable_grad_ckpt:
+            try:
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                if hasattr(model, "enable_input_require_grads"):
+                    model.enable_input_require_grads()
+                if hasattr(model.config, "use_cache"):
+                    model.config.use_cache = False
+                print("[QWen3] gradient_checkpointing ENABLED (use_reentrant=False)", flush=True)
+            except Exception as exc:
+                print(f"[QWen3] failed to enable gradient_checkpointing: {exc}", flush=True)
 
         self.model = model
         self.processor = processor
@@ -168,7 +221,10 @@ class _QWen3_VL_Interface(nn.Module):
             labels[labels == self.processor.tokenizer.pad_token_id] = -100  ## mask out pad tokens as well
             batch_inputs["labels"] = labels
 
-        return batch_inputs.to(self.model.device)
+        model_device = getattr(self.model, "device", None)
+        if model_device is None:
+            model_device = next(self.model.parameters()).device
+        return batch_inputs.to(model_device)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,39 @@ logger = logging.getLogger(__name__)
 def collate_fn(batch):
     return batch
 
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    try:
+        return cfg.get(key, default)
+    except AttributeError:
+        return getattr(cfg, key, default)
+
+def _cfg_set(cfg, key, value) -> None:
+    if cfg is None:
+        return
+    if OmegaConf.is_config(cfg):
+        OmegaConf.update(cfg, key, value, force_add=True)
+        return
+    try:
+        cfg[key] = value
+    except TypeError:
+        setattr(cfg, key, value)
+
+def _cfg_to_plain_dict(value, default=None):
+    if value is None:
+        return default
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return dict(value)
+
+def _cfg_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.lower() not in {"false", "0", "no", "off"}
+    return bool(value)
+
 def make_LeRobotSingleDataset(
     data_root_dir: Path | str,
     data_name: str,
@@ -47,7 +80,7 @@ def make_LeRobotSingleDataset(
         print(f"Warning: DataConfig for robot_type={robot_type!r} has no embodiment_tag, using {EmbodimentTag.NEW_EMBODIMENT} as default")
         embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
     
-    video_backend = data_cfg.get("video_backend", "decord") if data_cfg else "torchvision_av"
+    video_backend = _cfg_get(data_cfg, "video_backend", "decord") if data_cfg else "torchvision_av"
 
     # Opt-in factory hook: a DataConfig may define ``make_dataset(dataset_name=..., **ds_kwargs)``
     # to swap in a custom dataset class (e.g. with per-task filtering / chunk stride).
@@ -72,6 +105,7 @@ def make_LeRobotSingleDataset(
         video_backend=video_backend, # decord is more efficiency | torchvision_av for video.av1
         delete_pause_frame=delete_pause_frame,
         data_cfg=data_cfg,
+        dataset_action_type=getattr(data_config, "action_type", _cfg_get(data_cfg, "action_type", None) if data_cfg else None),
     )
 
 def get_vla_dataset(
@@ -100,6 +134,28 @@ def get_vla_dataset(
         included_datasets.add(dataset_key)
         filtered_mixture_spec.append((d_name, d_weight, robot_type))
 
+    joint_cfg = _cfg_get(data_cfg, "joint_statistics", None)
+    joint_statistics_enabled = _cfg_bool(_cfg_get(joint_cfg, "enabled", False), default=False)
+    if joint_statistics_enabled:
+        joint_dataset_paths = [
+            str(Path(data_root_dir) / d_name)
+            for d_name, _, _ in filtered_mixture_spec
+        ]
+        _cfg_set(data_cfg, "_joint_statistics_dataset_paths", joint_dataset_paths)
+
+    metadata_config = _cfg_to_plain_dict(_cfg_get(data_cfg, "metadata_config", None), default=None)
+    if metadata_config is None:
+        metadata_config = {
+            "percentile_mixing_method": "min_max",
+            "normalization_scope": "per_tag" if joint_statistics_enabled else "per_dataset",
+        }
+    else:
+        metadata_config.setdefault("percentile_mixing_method", "min_max")
+        metadata_config.setdefault(
+            "normalization_scope",
+            "per_tag" if joint_statistics_enabled else "per_dataset",
+        )
+
     dataset_mixture = []
     for d_name, d_weight, robot_type in filtered_mixture_spec:
         dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), d_name, robot_type, delete_pause_frame=delete_pause_frame, data_cfg=data_cfg), d_weight))
@@ -110,6 +166,7 @@ def get_vla_dataset(
         balance_dataset_weights=balance_dataset_weights,
         balance_trajectory_weights=balance_trajectory_weights,
         seed=seed,
+        metadata_config=metadata_config,
         data_cfg=data_cfg,
         **kwargs,
     )

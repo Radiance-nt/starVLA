@@ -66,7 +66,7 @@ echo "SLURM_NNODES=${SLURM_NNODES} TOTAL_GPUS=${TOTAL_GPUS}"
 
 for node in "${ALLOCATED_NODES[@]}"; do
   echo "[clean-check] ${node}: clean_process"
-  swatch -n "${node}" clean_process
+  swatch -n "${node}" clean_process || echo "[clean-check] ${node}: clean_process returned non-zero; continuing to nv/check_empty_run"
   echo "[clean-check] ${node}: nv"
   swatch -n "${node}" nv
   echo "[clean-check] ${node}: check_empty_run"

@@ -111,7 +111,7 @@ srun --jobid "${SLURM_JOB_ID}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 en
     --trainer.lora.lora_dropout 0.05 \
     --trainer.learning_rate.base 1.0e-05 \
     --trainer.learning_rate.qwen_vl_interface 1.0e-05 \
-    --trainer.max_train_steps 100000 \
+    --trainer.max_train_steps 80000 \
     --trainer.save_interval 5000 \
     --trainer.max_checkpoints_to_keep 2 \
     --trainer.logging_frequency 10 \

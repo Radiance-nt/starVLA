@@ -1,5 +1,5 @@
 run_id: arx_openpi_tube_human_v2_qwen3vl2b_qwenpi_v3_full_z2_statetext_jointstats
-run_root_dir: /mnt/hwfile/linzhanhui/runs_inspect/starVLA_direct
+run_root_dir: /mnt/inspurfs/vla_coop/linzhanhui/runs_inspect/starVLA
 seed: 42
 trackers: [jsonl, wandb]
 wandb_entity: null

@@ -4,12 +4,12 @@ set -euo pipefail
 
 PARTITION=${PARTITION:-wam_critic}
 TIME_LIMIT=${TIME_LIMIT:-10-00:00:00}
-NNODES=${NNODES:-4}
+NNODES=${NNODES:-2}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 CPUS_PER_TASK=${CPUS_PER_TASK:-128}
-JOB_NAME=${JOB_NAME:-arx_openpi_vlaccut_lora_z2_pd1_4n32g_cc}
+JOB_NAME=${JOB_NAME:-arx_openpi_qwen3vl2b_full_z2_pd16_2n16g_cc}
 REPO_ROOT=${REPO_ROOT:-/mnt/inspurfs/vla_coop/linzhanhui/projects/starVLA-ARX-starvla-dev-openpi-vlaccut-qwen3-clean}
-PAYLOAD=${PAYLOAD:-${REPO_ROOT}/examples/ARXHuman/train_files/run_clean_checked_arx_openpi_vlaccut30b_lora_z2_statetext_4n32g.sh}
+PAYLOAD=${PAYLOAD:-${REPO_ROOT}/examples/ARXHuman/train_files/run_clean_checked_arx_openpi_qwen3vl2b_full_z2_statetext_2n16g.sh}
 LOG_DIR=${LOG_DIR:-/mnt/petrelfs/linzhanhui/slurm_logs}
 LAUNCH_LOG=${LAUNCH_LOG:-${LOG_DIR}/${JOB_NAME}_launch_$(date +%Y%m%d_%H%M%S).log}
 

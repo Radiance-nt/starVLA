@@ -22,7 +22,7 @@ export TOTAL_GPUS=$((SLURM_NNODES * GPUS_PER_NODE))
 export GRAD_ACCUM=1
 export PER_DEVICE_BATCH_SIZE=1
 
-export REPO_ROOT=/mnt/inspurfs/vla_coop/linzhanhui/projects/starVLA-ARX-arx-openpi-vlaccut-clean
+export REPO_ROOT=/mnt/inspurfs/vla_coop/linzhanhui/projects/starVLA-ARX-starvla-dev-openpi-vlaccut-qwen3-clean
 export CONFIG_YAML=${REPO_ROOT}/examples/ARXHuman/train_files/starvla_train_arx_openpi_tube_human_v2_vlaccut_30b_pi_lora_z2_statetext.yaml
 export BASE_VLM=/mnt/hwfile/linzhanhui/projects/vpb_eval_clean/release/vlac_cut_model_release/VLAC-Cut
 export RUN_ROOT_DIR=/mnt/hwfile/linzhanhui/runs_inspect/starVLA_direct
@@ -109,6 +109,8 @@ srun --jobid "${SLURM_JOB_ID}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 en
     --trainer.lora.r 16 \
     --trainer.lora.lora_alpha 32 \
     --trainer.lora.lora_dropout 0.05 \
+    --trainer.learning_rate.base 1.0e-05 \
+    --trainer.learning_rate.qwen_vl_interface 1.0e-05 \
     --trainer.max_train_steps 100000 \
     --trainer.save_interval 5000 \
     --trainer.max_checkpoints_to_keep 2 \

@@ -1,4 +1,4 @@
-run_id: arx_openpi_tube_human_v2_vlaccut_30b_qwenpi_v3_lora_z2_statetext_jointstats
+run_id: arx_openpi_tube_human_v2_qwen3vl2b_qwenpi_v3_full_z2_statetext_jointstats
 run_root_dir: /mnt/hwfile/linzhanhui/runs_inspect/starVLA_direct
 seed: 42
 trackers: [jsonl, wandb]
@@ -9,12 +9,12 @@ is_debug: false
 framework:
   name: QwenPI_v3
   qwenvl:
-    base_vlm: /mnt/hwfile/linzhanhui/projects/vpb_eval_clean/release/vlac_cut_model_release/VLAC-Cut
+    base_vlm: /mnt/inspurfs/vla_coop/public_model_2/Qwen3-VL-2B-Instruct
     attn_implementation: sdpa
     ignore_mismatched_sizes: false
     enable_gradient_checkpointing: true
     vl_hidden_dim: 2048
-    num_vl_layers: 48
+    num_vl_layers: 28
 
   action_model:
     action_model_type: LayerwiseFM
@@ -74,7 +74,7 @@ datasets:
         gt: 1.3
         value: 3.45
     default_image_resolution: [3, 224, 224]
-    per_device_batch_size: 1
+    per_device_batch_size: 16
     num_workers: 1
     prefetch_factor: 1
     persistent_workers: false
@@ -105,7 +105,7 @@ trainer:
     min_lr: 5.0e-07
   freeze_modules: ""
   lora:
-    enabled: true
+    enabled: false
     module_path: qwen_vl_interface.model
     r: 16
     lora_alpha: 32

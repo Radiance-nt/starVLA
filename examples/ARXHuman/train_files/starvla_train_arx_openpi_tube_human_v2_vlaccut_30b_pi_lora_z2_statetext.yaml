@@ -10,7 +10,7 @@ framework:
   name: QwenPI_v3
   qwenvl:
     base_vlm: /mnt/hwfile/linzhanhui/projects/vpb_eval_clean/release/vlac_cut_model_release/VLAC-Cut
-    attn_implementation: sdpa
+    attn_implementation: flash_attention_2
     ignore_mismatched_sizes: false
     enable_gradient_checkpointing: true
     vl_hidden_dim: 2048

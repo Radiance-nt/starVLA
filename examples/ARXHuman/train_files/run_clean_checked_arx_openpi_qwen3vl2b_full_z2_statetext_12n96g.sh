@@ -93,7 +93,7 @@ srun --jobid "${SLURM_JOB_ID}" --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 en
     --config_yaml "${CONFIG_YAML}" \
     --framework.name QwenPI_v3 \
     --framework.qwenvl.base_vlm "${BASE_VLM}" \
-    --framework.qwenvl.attn_implementation sdpa \
+    --framework.qwenvl.attn_implementation flash_attention_2 \
     --framework.qwenvl.ignore_mismatched_sizes false \
     --framework.qwenvl.enable_gradient_checkpointing true \
     --framework.encode_state_as_text true \

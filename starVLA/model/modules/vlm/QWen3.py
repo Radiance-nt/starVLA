@@ -85,11 +85,12 @@ class _QWen3_VL_Interface(nn.Module):
         ignore_mismatched_sizes = qwenvl_config.get("ignore_mismatched_sizes", False)
         enable_grad_ckpt = bool(qwenvl_config.get("enable_gradient_checkpointing", False))
 
-        # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":
             if not has_flash_attn():
-                print("[WARNING] flash_attn not installed, falling back to sdpa")
-                attn_implementation = "sdpa"
+                raise ImportError(
+                    "framework.qwenvl.attn_implementation=flash_attention_2 was requested, "
+                    "but flash_attn is not installed. Install flash_attn or set attn_implementation=sdpa."
+                )
 
         hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         model_cls = Qwen3VLForConditionalGeneration

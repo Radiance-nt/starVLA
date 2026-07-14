@@ -10,7 +10,7 @@ framework:
   name: QwenPI_v3
   qwenvl:
     base_vlm: /mnt/inspurfs/vla_coop/public_model_2/Qwen3-VL-2B-Instruct
-    attn_implementation: sdpa
+    attn_implementation: flash_attention_2
     ignore_mismatched_sizes: false
     enable_gradient_checkpointing: true
     vl_hidden_dim: 2048

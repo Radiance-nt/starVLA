@@ -22,7 +22,7 @@ export TOTAL_GPUS=$((SLURM_NNODES * GPUS_PER_NODE))
 export GRAD_ACCUM=1
 export PER_DEVICE_BATCH_SIZE=16
 
-export REPO_ROOT=/mnt/inspurfs/vla_coop/linzhanhui/projects/starVLA-ARX-starvla-dev-openpi-vlaccut-qwen3-clean
+export REPO_ROOT=/mnt/inspurfs/vla_coop/linzhanhui/projects/starVLA-ARX
 export CONFIG_YAML=${REPO_ROOT}/examples/ARXHuman/train_files/starvla_train_arx_openpi_tube_human_v2_qwen3vl2b_pi_full_z2_statetext.yaml
 export BASE_VLM=/mnt/inspurfs/vla_coop/public_model_2/Qwen3-VL-2B-Instruct
 export RUN_ROOT_DIR=/mnt/inspurfs/vla_coop/linzhanhui/runs_inspect/starVLA

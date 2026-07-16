@@ -71,8 +71,10 @@ datasets:
       - action.delta_pos.yaw
     action_mode_value_maps:
       action.delta_pos.gripper:
-        gt: 1.3
-        value: 3.45
+        - gt: 1.3
+          value: 3.45
+        - le: 1.3
+          value: 0.0
     default_image_resolution: [3, 224, 224]
     per_device_batch_size: 16
     num_workers: 1

@@ -198,6 +198,8 @@ def _build_dataset_metadata(
             for stat_name, arr in combined.items():
                 if stat_name == "mask":
                     continue
+                if not isinstance(arr, (list, tuple)):
+                    continue
                 end = cursor + dim_k
                 if end > len(arr):
                     # Saved combined array shorter than expected (truncated
@@ -277,6 +279,12 @@ class PolicyNormProcessor:
         self._data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
         self._action_keys: List[str] = list(self._data_config.action_keys)
         self._state_keys: List[str] = list(getattr(self._data_config, "state_keys", []))
+        self._gripper_action_key: Optional[str] = getattr(self._data_config, "gripper_action_key", None)
+        self._gripper_action_threshold: Optional[float] = getattr(
+            self._data_config, "gripper_action_threshold", None
+        )
+        self._gripper_action_low: float = float(getattr(self._data_config, "gripper_action_low", 0.0))
+        self._gripper_action_high: float = float(getattr(self._data_config, "gripper_action_high", 1.0))
 
         # 2) Build training-time transform pipeline.
         transform = self._data_config.transform()
@@ -389,4 +397,19 @@ class PolicyNormProcessor:
             if isinstance(v, torch.Tensor):
                 v = v.detach().cpu().numpy()
             parts.append(np.asarray(v))
-        return np.concatenate(parts, axis=-1)
+        actions = np.concatenate(parts, axis=-1)
+        return self._clean_gripper_action(actions)
+
+    def _clean_gripper_action(self, actions: np.ndarray) -> np.ndarray:
+        if self._gripper_action_key is None or self._gripper_action_threshold is None:
+            return actions
+        if self._gripper_action_key not in self._action_keys:
+            return actions
+        gripper_idx = self._action_keys.index(self._gripper_action_key)
+        actions = actions.copy()
+        actions[..., gripper_idx] = np.where(
+            actions[..., gripper_idx] > float(self._gripper_action_threshold),
+            self._gripper_action_high,
+            self._gripper_action_low,
+        )
+        return actions

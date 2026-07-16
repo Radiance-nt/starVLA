@@ -11,6 +11,11 @@ from starVLA.dataloader.gr00t_lerobot.transform.state_action import (
 
 class ArxOpenPiDeltaPose7DDataConfig:
     action_type = "delta_ee"
+    embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
+    gripper_action_key = "action.delta_pos.gripper"
+    gripper_action_threshold = 1.3
+    gripper_action_low = 0.0
+    gripper_action_high = 3.45
     video_keys = ["video.front", "video.wrist"]
     state_keys = [
         "state.end_effector_pos.x",

@@ -28,6 +28,7 @@ import hashlib
 import io
 import json, torch
 import copy
+from collections.abc import Mapping
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
@@ -209,13 +210,16 @@ def _normalize_action_mode_wrap_keys(action_mode_wrap_keys: Sequence[str] | None
     return normalized
 
 
-def _normalize_action_mode_value_maps(action_mode_value_maps: dict | None) -> dict[str, dict]:
+def _normalize_action_mode_value_maps(action_mode_value_maps: dict | None) -> dict[str, list[dict]]:
     normalized = {}
     for action_key, spec in (action_mode_value_maps or {}).items():
         action_key = str(action_key)
         if not action_key.startswith("action."):
             action_key = f"action.{action_key}"
-        normalized[action_key] = dict(spec)
+        if isinstance(spec, Mapping):
+            normalized[action_key] = [dict(spec)]
+        else:
+            normalized[action_key] = [dict(item) for item in spec]
     return normalized
 
 
@@ -223,8 +227,12 @@ def _wrap_to_pi(values: np.ndarray) -> np.ndarray:
     return (values + np.pi) % (2 * np.pi) - np.pi
 
 
-def _apply_action_value_map(values: np.ndarray, spec: dict) -> np.ndarray:
+def _apply_action_value_map(values: np.ndarray, spec: dict | list[dict]) -> np.ndarray:
     out = values.copy()
+    if isinstance(spec, list):
+        for item in spec:
+            out = _apply_action_value_map(out, item)
+        return out
     if "gt" in spec:
         out = np.where(out > float(spec["gt"]), float(spec["value"]), out)
     if "ge" in spec:

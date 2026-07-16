@@ -93,7 +93,7 @@ datasets:
 trainer:
   epochs: 100
   max_train_steps: 80000
-  num_warmup_steps: 5000
+  num_warmup_steps: 4000
   save_interval: 5000
   max_checkpoints_to_keep: 2
   eval_interval: 200
